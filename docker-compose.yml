@@ -1,0 +1,27 @@
+services:
+  purchase-forecast:
+    build:
+      context: .
+    environment:
+      APP_ENV: local
+      APP_NAME: purchase-forecast-service
+      APP_PORT: 8000
+      LOG_LEVEL: debug
+      TZ: Europe/Moscow
+      REPORT_UPLOAD_DIR: /app/data/uploads
+      APP_USERNAME: ${APP_USERNAME:-}
+      APP_PASSWORD: ${APP_PASSWORD:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/examples:/app/data/examples:ro
+      - ./data/local:/app/data/local:ro
+      - report-uploads:/app/data/uploads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  report-uploads:

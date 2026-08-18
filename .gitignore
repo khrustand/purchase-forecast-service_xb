@@ -1,0 +1,47 @@
+﻿# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Build artifacts
+dist/
+build/
+coverage/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+tools/
+android/.gradle/
+android/app/build/
+android/build/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local data and logs
+logs/
+reports/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+data/local/
+data/raw/
+data/exports/
+data/uploads/
+
+# Editors and OS
+.codex/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+debug.log

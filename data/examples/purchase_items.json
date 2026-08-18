@@ -1,0 +1,47 @@
+[
+  {
+    "name": "chicken lunch",
+    "category": "lunches",
+    "daily_usage": 35,
+    "unit": "pcs",
+    "package_quantity": 70,
+    "shelf_life_days": 2,
+    "estimated_price": 9800
+  },
+  {
+    "name": "caesar salad",
+    "category": "salads",
+    "daily_usage": 18,
+    "unit": "pcs",
+    "package_quantity": 36,
+    "shelf_life_days": 2,
+    "estimated_price": 5400
+  },
+  {
+    "name": "chicken roll",
+    "category": "rolls",
+    "daily_usage": 22,
+    "unit": "pcs",
+    "package_quantity": 44,
+    "shelf_life_days": 2,
+    "estimated_price": 6600
+  },
+  {
+    "name": "soup of the day",
+    "category": "hot_meals",
+    "daily_usage": 20,
+    "unit": "pcs",
+    "package_quantity": 40,
+    "shelf_life_days": 2,
+    "estimated_price": 4800
+  },
+  {
+    "name": "pasta with chicken",
+    "category": "hot_meals",
+    "daily_usage": 14,
+    "unit": "pcs",
+    "package_quantity": 28,
+    "shelf_life_days": 2,
+    "estimated_price": 5600
+  }
+]

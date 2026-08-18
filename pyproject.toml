@@ -1,0 +1,10 @@
+﻿[project]
+name = "purchase-forecast-service"
+version = "0.1.0"
+description = "Personal service for expense analytics, meal planning, home tasks, and purchase forecasting."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.unittest]
+start-dir = "tests"
+

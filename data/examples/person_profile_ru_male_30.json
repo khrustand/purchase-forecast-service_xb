@@ -1,0 +1,19 @@
+{
+  "profile_id": "ru_male_30_baseline",
+  "sex": "male",
+  "age_years": 30,
+  "country": "Russia",
+  "height_cm": 176.4,
+  "baseline_bmi": 25.8,
+  "baseline_weight_kg": 80.3,
+  "target_bmi_min": 22.0,
+  "target_bmi_max": 24.0,
+  "healthy_bmi_min": 18.5,
+  "healthy_bmi_max": 24.9,
+  "target_waist_to_height_max": 0.49,
+  "risk_waist_to_height_threshold": 0.5,
+  "notes": [
+    "Baseline is for demo calculations before personal measurements are entered.",
+    "Targets are planning hints, not medical advice."
+  ]
+}

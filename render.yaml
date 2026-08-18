@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: purchase-forecast-service
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: APP_PORT
+        value: 10000
+      - key: TZ
+        value: Europe/Moscow
+      - key: REPORT_UPLOAD_DIR
+        value: /app/data/uploads
+      - key: APP_USERNAME
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+    disk:
+      name: monthly-reports
+      mountPath: /app/data/uploads
+      sizeGB: 1
