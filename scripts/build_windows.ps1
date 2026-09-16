@@ -41,10 +41,15 @@ if (-not (Test-PyInstaller)) {
     --noconfirm `
     --clean `
     --onefile `
+    --windowed `
     --name purchase-forecast-service `
+    --add-data "data\examples;data\examples" `
     --collect-submodules src `
     --collect-submodules scripts `
     src\app\windows_launcher.py
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
 
 Copy-Item -LiteralPath .env.example -Destination dist\.env.example -Force
 

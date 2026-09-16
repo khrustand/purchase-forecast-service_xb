@@ -40,13 +40,14 @@ from src.infrastructure.app_config import (
     has_database_config,
     write_appdata_env,
 )
+from src.infrastructure.paths import project_path
 from src.infrastructure.weather import load_met_norway_forecast
 
 
-DEFAULT_ITEMS_PATH = Path("data/examples/purchase_items.json")
-DEFAULT_SALES_PATH = Path("data/local/culinary_sales_june_july.xlsx")
-DEFAULT_WASTE_PATH = Path("data/local/culinary_waste_june_july.xlsx")
-DEFAULT_SHELF_LIFE_PATH = Path("data/local/Хранение и сроки годности, реализации.xlsx")
+DEFAULT_ITEMS_PATH = project_path("data/examples/purchase_items.json")
+DEFAULT_SALES_PATH = project_path("data/local/culinary_sales_june_july.xlsx")
+DEFAULT_WASTE_PATH = project_path("data/local/culinary_waste_june_july.xlsx")
+DEFAULT_SHELF_LIFE_PATH = project_path("data/local/Хранение и сроки годности, реализации.xlsx")
 DEFAULT_ORDER_CYCLE_DAYS = 2
 REPORT_STORAGE = create_report_storage()
 WEEKDAY_LABELS = {0: "ПН", 1: "ВТ", 2: "СР", 3: "ЧТ", 4: "ПТ", 5: "СБ", 6: "ВС"}
