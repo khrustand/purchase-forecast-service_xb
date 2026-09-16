@@ -186,6 +186,20 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1 -InstallPyIns
 dist\purchase-forecast-service.exe
 ```
 
+Установщик для чистой Windows-машины:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_installer.ps1 -InstallInno
+```
+
+Готовый установщик:
+
+```text
+dist\PurchaseForecastServiceSetup.exe
+```
+
+Этот файл можно перенести на новый компьютер с Windows и интернетом. Установщик не требует Python, Docker, VS Code или Android Studio: он ставит уже собранное приложение, создает ярлыки и предлагает запустить сервис сразу после установки.
+
 Если Supabase уже настроен, exe сразу открывает главный экран заказов. Загрузка отчетов не является стартовым шагом: программа берет данные из подключенной базы и Supabase Storage.
 
 Если настроек еще нет, exe откроет экран первичной настройки. На нем нужно один раз указать Supabase URL, secret key, bucket `uploads` и при необходимости логин/пароль входа в сервис. Настройки сохраняются локально:
