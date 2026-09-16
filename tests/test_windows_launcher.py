@@ -37,7 +37,7 @@ class WindowsLauncherTests(TestCase):
             clear=True,
         ):
             with patch.object(windows_launcher, "load_runtime_env", lambda *_args: None):
-                with patch.object(windows_launcher, "open_browser_later", lambda url: calls.append(url)):
+                with patch.object(windows_launcher, "open_app_window_later", lambda url: calls.append(url)):
                     with patch.object(windows_launcher, "run_app_server", lambda: calls.append("server")):
                         result = windows_launcher.main()
                         self.assertEqual(os.environ["APP_PORT"], "8000")
@@ -52,7 +52,7 @@ class WindowsLauncherTests(TestCase):
 
         with patch.dict(os.environ, {}, clear=True):
             with patch.object(windows_launcher, "load_runtime_env", lambda *_args: None):
-                with patch.object(windows_launcher, "open_browser_later", lambda url: calls.append(url)):
+                with patch.object(windows_launcher, "open_app_window_later", lambda url: calls.append(url)):
                     with patch.object(windows_launcher, "run_app_server", lambda: calls.append("server")):
                         result = windows_launcher.main()
                         self.assertEqual(os.environ["APP_PORT"], "8000")
@@ -60,11 +60,39 @@ class WindowsLauncherTests(TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(calls, ["http://localhost:8000/setup", "server"])
 
-    def test_open_browser_later_uses_given_url(self) -> None:
-        from src.app.windows_launcher import open_browser_later
+    def test_open_app_window_later_uses_given_url(self) -> None:
+        from src.app.windows_launcher import open_app_window_later
 
         opened: list[str] = []
-        thread = open_browser_later("http://localhost:9000", delay_seconds=0, opener=opened.append)
+        thread = open_app_window_later("http://localhost:9000", delay_seconds=0, opener=opened.append)
         thread.join(timeout=2)
 
         self.assertEqual(opened, ["http://localhost:9000"])
+
+    def test_open_windows_app_window_uses_edge_app_mode(self) -> None:
+        from src.app.windows_launcher import open_windows_app_window
+
+        calls: list[list[str]] = []
+
+        self.assertTrue(
+            open_windows_app_window(
+                "http://localhost:8000",
+                popen=lambda args: calls.append(list(args)),
+                fallback=lambda _url: None,
+            )
+        )
+        self.assertEqual(calls, [["msedge", "--app=http://localhost:8000", "--new-window"]])
+
+    def test_open_windows_app_window_falls_back_to_browser(self) -> None:
+        from src.app.windows_launcher import open_windows_app_window
+
+        opened: list[str] = []
+
+        self.assertFalse(
+            open_windows_app_window(
+                "http://localhost:8000",
+                popen=lambda _args: (_ for _ in ()).throw(FileNotFoundError()),
+                fallback=opened.append,
+            )
+        )
+        self.assertEqual(opened, ["http://localhost:8000"])

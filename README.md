@@ -172,7 +172,7 @@ python -m src.app.web_server
 
 ## Windows-приложение
 
-Первый Windows-выпуск работает как локальное веб-приложение: запускается `purchase-forecast-service.exe`, поднимает сервер на `http://localhost:8000` и открывает браузер.
+Windows-выпуск работает как самостоятельное локальное приложение: запускается `purchase-forecast-service.exe`, поднимает сервер внутри процесса и открывает отдельное окно приложения через Microsoft Edge в режиме `--app`. В обычном сценарии пользователь не работает с адресной строкой `localhost` и не видит консоль.
 
 Сборка:
 
@@ -186,7 +186,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1 -InstallPyIns
 dist\purchase-forecast-service.exe
 ```
 
-При первом запуске exe сам откроет страницу `http://localhost:8000/setup`. На ней нужно один раз указать Supabase URL, secret key, bucket `uploads` и при необходимости логин/пароль входа в сервис. Настройки сохраняются локально:
+Если Supabase уже настроен, exe сразу открывает главный экран заказов. Загрузка отчетов не является стартовым шагом: программа берет данные из подключенной базы и Supabase Storage.
+
+Если настроек еще нет, exe откроет экран первичной настройки. На нем нужно один раз указать Supabase URL, secret key, bucket `uploads` и при необходимости логин/пароль входа в сервис. Настройки сохраняются локально:
 
 ```text
 %APPDATA%\purchase-forecast-service\.env

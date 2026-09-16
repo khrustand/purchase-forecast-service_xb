@@ -54,6 +54,6 @@ if ($LASTEXITCODE -ne 0) {
 Copy-Item -LiteralPath .env.example -Destination dist\.env.example -Force
 
 Write-Host "Windows app built: dist\purchase-forecast-service.exe"
-Write-Host "First launch opens http://localhost:8000/setup if Supabase settings are missing."
+Write-Host "Launch opens a standalone app window. Setup appears only when Supabase settings are missing."
 Write-Host "Saved settings path: %APPDATA%\purchase-forecast-service\.env"
 Write-Host "Optional portable override: place .env next to the exe."
