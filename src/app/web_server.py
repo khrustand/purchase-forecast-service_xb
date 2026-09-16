@@ -31,9 +31,16 @@ from scripts.analyze_culinary_strategy import (
 from src.infrastructure.report_storage import (
     ALLOWED_REPORT_TYPES,
     MAX_UPLOAD_BYTES,
-    MonthlyReportStorage,
     ReportValidationError,
+    create_report_storage,
 )
+from src.infrastructure.app_config import (
+    AppConfigError,
+    appdata_env_path,
+    has_database_config,
+    write_appdata_env,
+)
+from src.infrastructure.weather import load_met_norway_forecast
 
 
 DEFAULT_ITEMS_PATH = Path("data/examples/purchase_items.json")
@@ -41,7 +48,7 @@ DEFAULT_SALES_PATH = Path("data/local/culinary_sales_june_july.xlsx")
 DEFAULT_WASTE_PATH = Path("data/local/culinary_waste_june_july.xlsx")
 DEFAULT_SHELF_LIFE_PATH = Path("data/local/Хранение и сроки годности, реализации.xlsx")
 DEFAULT_ORDER_CYCLE_DAYS = 2
-REPORT_STORAGE = MonthlyReportStorage()
+REPORT_STORAGE = create_report_storage()
 WEEKDAY_LABELS = {0: "ПН", 1: "ВТ", 2: "СР", 3: "ЧТ", 4: "ПТ", 5: "СБ", 6: "ВС"}
 
 
@@ -286,6 +293,9 @@ def build_culinary_strategy_payload(
     order_days: int = DEFAULT_ORDER_CYCLE_DAYS,
     reference_day: date | None = None,
 ) -> dict[str, Any] | None:
+    live_weather = load_met_norway_forecast()
+    if live_weather is not None:
+        WEATHER_BY_DATE.update(live_weather.days)
     uploaded_sales_paths = REPORT_STORAGE.paths("sales")
     effective_sales_paths = uploaded_sales_paths or ([sales_path] if sales_path.exists() else [])
     if not effective_sales_paths:
@@ -312,17 +322,29 @@ def build_culinary_strategy_payload(
     recommendations = build_recommendations(items, order_days, waste_counts, shelf_life)
     daily_menu = _with_decision_explanations(build_daily_menu(recommendations))
     forecast_reference_day = reference_day or date.today() - timedelta(days=1)
+    rain_impact = _rain_sales_impact(items, effective_start_day, actual_end_day)
 
     return {
         "period": f"{effective_start_day.isoformat()}..{actual_end_day.isoformat()}",
         "weather_city": "Санкт-Петербург",
+        "weather_source": live_weather.source if live_weather else "встроенные данные",
+        "weather_updated_at": live_weather.updated_at if live_weather else None,
+        "weather_stale": live_weather.stale if live_weather else False,
         "order_days": order_days,
         "total_quantity": sum(int(item["order_for_2_days"]) for item in daily_menu),
         "summary": daily_menu_summary(daily_menu),
         "category_totals": _category_totals(daily_menu),
         "role_groups": _group_menu_by_role(daily_menu),
         "retrospective_orders": _retrospective_orders(items, daily_menu, reference_day=forecast_reference_day),
-        "future_orders": _future_orders(items, daily_menu, waste_by_date, reference_day=forecast_reference_day, count=4),
+        "future_orders": _future_orders(
+            items,
+            daily_menu,
+            waste_by_date,
+            reference_day=forecast_reference_day,
+            count=4,
+            rain_traffic_factor=float(rain_impact["applied_factor"]),
+        ),
+        "rain_sales_impact": rain_impact,
         "weather_sales_summary": _weather_sales_summary(items, effective_start_day, actual_end_day),
         "waste_leaders": _with_decision_explanations(waste_leaders(recommendations, limit=12)),
     }
@@ -515,6 +537,7 @@ def _future_orders(
     waste_by_date: dict[str, dict[date, int]],
     reference_day: date,
     count: int,
+    rain_traffic_factor: float = 0.88,
 ) -> list[dict[str, object]]:
     starts = []
     cursor = reference_day + timedelta(days=1)
@@ -523,7 +546,14 @@ def _future_orders(
             starts.append(cursor)
         cursor += timedelta(days=1)
     return [
-        _future_period(start, 3 if start.weekday() == 4 else 2, menu_items, sales_items, waste_by_date)
+        _future_period(
+            start,
+            3 if start.weekday() == 4 else 2,
+            menu_items,
+            sales_items,
+            waste_by_date,
+            rain_traffic_factor,
+        )
         for start in starts
     ]
 
@@ -534,6 +564,7 @@ def _future_period(
     menu_items: list[dict[str, object]],
     sales_items: list[Any],
     waste_by_date: dict[str, dict[date, int]],
+    rain_traffic_factor: float,
 ) -> dict[str, object]:
     period_days = [period_start + timedelta(days=offset) for offset in range(days)]
     item_by_name = {item.name: item for item in sales_items}
@@ -541,27 +572,41 @@ def _future_period(
     rows = [
         {
             **item,
-            "forecast_quantity": _period_quantity(item, period_days),
-            "weather_factor": round(_weather_factor(str(item["category"]), period_days), 2),
+            "forecast_quantity": _period_quantity(item, period_days, rain_traffic_factor),
+            "weather_factor": round(_weather_factor(str(item["category"]), period_days, rain_traffic_factor), 2),
             "previous_period_sales": _sales_for_period(str(item["name"]), previous_period_days, item_by_name),
             "previous_period_waste": _waste_for_period(str(item["name"]), previous_period_days, waste_by_date),
             "previous_period_label": _period_range_label(previous_period_days),
         }
         for item in menu_items
     ]
-    rows = _cap_weekend_rows(rows, menu_items, sales_items) if days == 3 else rows
     rows = [
         {
             **item,
-            "daily_forecast": _daily_distribution(
-                item_by_name.get(str(item["name"])),
-                str(item["category"]),
-                period_days,
-                int(item["forecast_quantity"]),
+            "daily_forecast": (
+                _weekday_daily_forecast(
+                    item_by_name.get(str(item["name"])),
+                    str(item["category"]),
+                    period_days,
+                    rain_traffic_factor,
+                )
+                if days == 3
+                else _daily_distribution(
+                    item_by_name.get(str(item["name"])),
+                    str(item["category"]),
+                    period_days,
+                    int(item["forecast_quantity"]),
+                    rain_traffic_factor,
+                )
             ),
         }
         for item in rows
     ]
+    if days == 3:
+        rows = [
+            {**item, "forecast_quantity": sum(int(day["quantity"]) for day in item["daily_forecast"])}
+            for item in rows
+        ]
     daily_totals = [
         {
             "date": day.isoformat(),
@@ -571,6 +616,12 @@ def _future_period(
                 for item in rows
             ),
             "weather": str(WEATHER_BY_DATE.get(day, {"summary": "нет данных"})["summary"]),
+            "weather_available": day in WEATHER_BY_DATE,
+            "rain": bool(WEATHER_BY_DATE.get(day, {}).get("rain")),
+            "traffic_factor": round(_weather_factor("", [day], rain_traffic_factor), 2),
+            "weather_adjustment_percent": round(
+                (_weather_factor("", [day], rain_traffic_factor) - 1) * 100
+            ),
         }
         for day in period_days
     ]
@@ -583,6 +634,7 @@ def _future_period(
         "previous_period": _period_range_label(previous_period_days),
         "shelf_life_mix": _shelf_life_mix(rows),
         "weather": _weather_summary(period_days),
+        "rain_traffic_factor": round(rain_traffic_factor, 2),
         "total_quantity": sum(int(item["forecast_quantity"]) for item in rows),
         "daily_totals": daily_totals,
         "rows": sorted(rows, key=lambda item: (str(item["category"]), str(item["name"]))),
@@ -594,6 +646,7 @@ def _daily_distribution(
     category: str,
     period_days: list[date],
     total_quantity: int,
+    rain_traffic_factor: float,
 ) -> list[dict[str, object]]:
     weights = []
     for day in period_days:
@@ -603,7 +656,7 @@ def _daily_distribution(
             if historic_day.weekday() == day.weekday()
         ]
         weekday_average = sum(historic) / len(historic) if historic else 1.0
-        weights.append(max(0.05, weekday_average) * _weather_factor(category, [day]))
+        weights.append(max(0.05, weekday_average) * _weather_factor(category, [day], rain_traffic_factor))
     weight_total = sum(weights) or len(period_days)
     raw = [total_quantity * weight / weight_total for weight in weights]
     quantities = [int(value) for value in raw]
@@ -616,10 +669,39 @@ def _daily_distribution(
             "date": day.isoformat(),
             "weekday": WEEKDAY_LABELS[day.weekday()],
             "quantity": quantities[index],
-            "weather_factor": round(_weather_factor(category, [day]), 2),
+            "weather_factor": round(_weather_factor(category, [day], rain_traffic_factor), 2),
         }
         for index, day in enumerate(period_days)
     ]
+
+
+def _weekday_daily_forecast(
+    source: Any | None,
+    category: str,
+    period_days: list[date],
+    rain_traffic_factor: float,
+) -> list[dict[str, object]]:
+    observed_values = list(source.by_date.values()) if source is not None else []
+    fallback_average = sum(observed_values) / len(observed_values) if observed_values else 0.0
+    result = []
+    for day in period_days:
+        matching_values = (
+            [quantity for historic_day, quantity in source.by_date.items() if historic_day.weekday() == day.weekday()]
+            if source is not None
+            else []
+        )
+        weekday_average = sum(matching_values) / len(matching_values) if matching_values else fallback_average
+        factor = _weather_factor(category, [day], rain_traffic_factor)
+        result.append(
+            {
+                "date": day.isoformat(),
+                "weekday": WEEKDAY_LABELS[day.weekday()],
+                "quantity": max(0, round(weekday_average * factor)),
+                "weather_factor": round(factor, 2),
+                "history_points": len(matching_values),
+            }
+        )
+    return result
 
 
 def _previous_matching_period_days(
@@ -641,11 +723,12 @@ def _sales_for_period(
     item_name: str,
     period_days: list[date],
     item_by_name: dict[str, Any],
-) -> int:
+) -> int | None:
     item = item_by_name.get(item_name)
-    if item is None:
-        return 0
-    return int(sum(item.by_date.get(day, 0) for day in period_days))
+    if item is None or not period_days:
+        return None
+    observed = [item.by_date[day] for day in period_days if day in item.by_date]
+    return int(sum(observed)) if observed else None
 
 
 def _waste_for_period(
@@ -740,18 +823,22 @@ def _rebalance_to_total(rows: list[dict[str, object]], target_total: int) -> lis
     return rows
 
 
-def _period_quantity(item: dict[str, object], period_days: list[date]) -> int:
+def _period_quantity(
+    item: dict[str, object], period_days: list[date], rain_traffic_factor: float = 0.88
+) -> int:
     base_daily = int(item["order_for_2_days"]) / DEFAULT_ORDER_CYCLE_DAYS
     shelf_life_days = int(item.get("shelf_life_days", 3))
     target_days = min(len(period_days), DEFAULT_ORDER_CYCLE_DAYS)
     effective_days = min(target_days, shelf_life_days)
-    quantity = base_daily * effective_days * _weather_factor(str(item["category"]), period_days)
+    quantity = base_daily * effective_days * _weather_factor(
+        str(item["category"]), period_days, rain_traffic_factor
+    )
     return max(1, round(quantity))
 
 
 def _order_policy(period_days: list[date]) -> str:
     if len(period_days) >= 3:
-        return "трехдневное окно: объем держим как 2 дня, третий день закрываем ротацией и позициями со сроком 3 дня"
+        return "трехдневное окно: пятница, суббота и воскресенье рассчитаны отдельно по истории соответствующего дня недели; позиции со сроком 2 дня требуют отдельного пополнения на воскресенье"
     return "двухдневное окно: считаем базовый объем на 2 дня"
 
 
@@ -766,7 +853,8 @@ def _weather_sales_summary(items: list[Any], start_day: date, end_day: date) -> 
     groups: dict[tuple[str, str], dict[str, object]] = {}
     for day in _date_range(start_day, end_day):
         weather = WEATHER_BY_DATE.get(day)
-        if not weather:
+        observed_items = [item for item in items if day in item.by_date]
+        if not weather or not observed_items:
             continue
         month = _month_label(day)
         bucket = _weather_bucket(weather)
@@ -788,8 +876,8 @@ def _weather_sales_summary(items: list[Any], start_day: date, end_day: date) -> 
         day_total = 0.0
         category_sales = group["category_sales"]
         assert isinstance(category_sales, dict)
-        for item in items:
-            quantity = float(item.by_date.get(day, 0))
+        for item in observed_items:
+            quantity = float(item.by_date[day])
             day_total += quantity
             if item.category in category_sales:
                 category_sales[item.category] = float(category_sales[item.category]) + quantity
@@ -814,6 +902,45 @@ def _weather_sales_summary(items: list[Any], start_day: date, end_day: date) -> 
             }
         )
     return sorted(result, key=lambda item: (_month_order(str(item["month"])), str(item["weather_bucket"])))
+
+
+def _rain_sales_impact(items: list[Any], start_day: date, end_day: date) -> dict[str, object]:
+    """Estimate rain impact after removing the ordinary weekday pattern."""
+    daily_sales = {}
+    for day in _date_range(start_day, end_day):
+        observed_values = [float(item.by_date[day]) for item in items if day in item.by_date]
+        if day in WEATHER_BY_DATE and observed_values:
+            daily_sales[day] = sum(observed_values)
+    dry_by_weekday: dict[int, list[float]] = {}
+    for day, quantity in daily_sales.items():
+        if not WEATHER_BY_DATE[day].get("rain"):
+            dry_by_weekday.setdefault(day.weekday(), []).append(quantity)
+
+    normalized_rain = []
+    rainy_sales = []
+    dry_sales = []
+    for day, quantity in daily_sales.items():
+        if WEATHER_BY_DATE[day].get("rain"):
+            baseline = dry_by_weekday.get(day.weekday(), [])
+            if baseline and sum(baseline) > 0:
+                normalized_rain.append(quantity / (sum(baseline) / len(baseline)))
+            rainy_sales.append(quantity)
+        else:
+            dry_sales.append(quantity)
+
+    observed_factor = sum(normalized_rain) / len(normalized_rain) if normalized_rain else 0.88
+    applied_factor = min(0.95, max(0.70, observed_factor))
+    return {
+        "method": "продажи в дождь относительно сухих дней того же дня недели",
+        "rain_days": len(rainy_sales),
+        "dry_days": len(dry_sales),
+        "rain_sales_per_day": round(sum(rainy_sales) / len(rainy_sales), 1) if rainy_sales else None,
+        "dry_sales_per_day": round(sum(dry_sales) / len(dry_sales), 1) if dry_sales else None,
+        "observed_factor": round(observed_factor, 2),
+        "applied_factor": round(applied_factor, 2),
+        "applied_change_percent": round((applied_factor - 1) * 100),
+        "note": "Коэффициент ограничен диапазоном 0,70–0,95: дождливый день всегда снижает общий трафик, но не более чем на 30%.",
+    }
 
 
 def _date_range(start_day: date, end_day: date) -> list[date]:
@@ -846,25 +973,28 @@ def _month_order(month: str) -> int:
     return {"июнь": 6, "июль": 7, "август": 8}.get(month, 99)
 
 
-def _weather_factor(category: str, period_days: list[date]) -> float:
-    weather = [WEATHER_BY_DATE.get(day, {}) for day in period_days]
-    has_rain = any(day.get("rain") for day in weather)
-    max_temp = max([int(day.get("temperature", 22)) for day in weather] or [22])
-    has_weekend = any(day.weekday() >= 5 for day in period_days)
-    factor = 1.0
-    if has_rain and category == "Супы":
-        factor += 0.10
-    if has_rain and category == "Горячее":
-        factor += 0.05
-    if has_rain and category == "Салаты":
-        factor -= 0.05
-    if max_temp >= 27 and category == "Салаты":
-        factor += 0.08
-    if max_temp >= 27 and category in {"Супы", "Горячее"}:
-        factor -= 0.03
-    if has_weekend and category == "Завтраки":
-        factor += 0.05
-    return max(0.75, factor)
+def _weather_factor(
+    category: str, period_days: list[date], rain_traffic_factor: float = 0.88
+) -> float:
+    factors = []
+    for day in period_days:
+        weather = WEATHER_BY_DATE.get(day, {})
+        factor = rain_traffic_factor if weather.get("rain") else 1.0
+        temperature = int(weather.get("temperature", 22))
+        if weather.get("rain") and category == "Супы":
+            factor += 0.06
+        if weather.get("rain") and category == "Горячее":
+            factor += 0.03
+        if weather.get("rain") and category == "Салаты":
+            factor -= 0.04
+        if temperature >= 27 and category == "Салаты":
+            factor += 0.08
+        if temperature >= 27 and category in {"Супы", "Горячее"}:
+            factor -= 0.03
+        if day.weekday() >= 5 and category == "Завтраки":
+            factor += 0.05
+        factors.append(max(0.70, factor))
+    return sum(factors) / len(factors) if factors else 1.0
 
 
 def _weather_summary(period_days: list[date]) -> str:
@@ -895,6 +1025,74 @@ def _period_label(period_start: date, days: int) -> str:
     return labels.get(period_start.weekday(), f"{days} дн.")
 
 
+def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
+    if strategy is None:
+        return "<section class='workspace'><h2>Ближайший заказ</h2><div class='signal-box'>Загрузите отчет продаж, чтобы построить прогноз.</div></section>"
+
+    current = strategy["future_orders"][0]
+    following = strategy["future_orders"][1:]
+    day_headings = "".join(
+        f"<th>{escape(str(day['weekday']))}<span>{escape(str(day['date']))}</span></th>"
+        for day in current["daily_totals"]
+    )
+    rows = "".join(_render_operational_row(item) for item in current["rows"])
+    next_cards = "".join(
+        f"<a class='next-order-card' href='/?start={period['start']}&days=14'>"
+        f"<span>{escape(str(period['label']))} · {escape(str(period['start']))}—{escape(str(period['end']))}</span>"
+        f"<strong>{period['total_quantity']} шт.</strong><small>{escape(str(period['weather']))}</small></a>"
+        for period in following
+    )
+    rain_days = sum(1 for day in current["daily_totals"] if day["rain"])
+    missing_weather = sum(1 for day in current["daily_totals"] if not day["weather_available"])
+    short_shelf = sum(1 for item in current["rows"] if int(item["shelf_life_days"]) < int(current["days"]))
+    alerts = []
+    if rain_days:
+        alerts.append(f"Осадки повлияли на {rain_days} дн. заказа")
+    if missing_weather:
+        alerts.append(f"Нет прогноза погоды на {missing_weather} дн.")
+    if short_shelf:
+        alerts.append(f"{short_shelf} поз. требуют дополнительной поставки")
+    alert_html = "".join(f"<span class='alert-chip'>{escape(alert)}</span>" for alert in alerts) or "<span class='ok-chip'>Критичных предупреждений нет</span>"
+    updated = strategy["weather_updated_at"] or "нет данных"
+
+    return f"""
+    <section class="workspace order-focus">
+      <div class="workspace-head">
+        <div><span class="eyebrow">Ближайший заказ</span><h2>{current['label']} · {current['start']}—{current['end']}</h2>
+        <div class="muted">Продажи учтены по {strategy['period'].split('..')[-1]} · погода: {escape(str(strategy['weather_source']))}, {escape(str(updated))}</div></div>
+        <div class="order-total"><span>Заказать</span><strong>{current['total_quantity']}</strong><small>штук</small></div>
+      </div>
+      <div class="daily-strip">{_render_daily_totals(current['daily_totals'])}</div>
+      <div class="alert-row">{alert_html}</div>
+      <div class="table-wrap">
+        <table class="order-table"><thead><tr><th>Позиция</th>{day_headings}<th>Итого</th><th>Статус</th><th></th></tr></thead><tbody>{rows}</tbody></table>
+      </div>
+    </section>
+    <section class="next-orders"><div class="section-title"><div><span class="eyebrow">Далее</span><h2>Следующие заказы</h2></div><a href="/analytics">Открыть аналитику →</a></div><div class="next-order-grid">{next_cards}</div></section>
+    <dialog id="item-dialog"><button class="dialog-close" aria-label="Закрыть">×</button><div id="dialog-content"></div></dialog>
+    """
+
+
+def _render_operational_row(item: dict[str, object]) -> str:
+    day_cells = "".join(f"<td class='number'>{day['quantity']}</td>" for day in item["daily_forecast"])
+    status = str(item.get("waste_risk", "контроль"))
+    details = (
+        f"Категория: {item['category']}\n"
+        f"Срок хранения: {item['shelf_life_days']} дн.\n"
+        f"Продажи прошлого окна: {item['previous_period_sales'] if item['previous_period_sales'] is not None else 'нет данных'}\n"
+        f"Списания прошлого окна: {item['previous_period_waste']}\n"
+        f"Погодный коэффициент: ×{item['weather_factor']}\n"
+        f"Решение: {item.get('decision_reason', item.get('strategy', 'нет данных'))}\n"
+        f"Риск: {_future_risk_context(item)}"
+    )
+    return (
+        f"<tr><td><strong>{escape(str(item['name']))}</strong><span>{escape(str(item['category']))}</span></td>"
+        f"{day_cells}<td class='number total-cell'>{item['forecast_quantity']}</td>"
+        f"<td><i class='{_risk_class(status)}'>{escape(status)}</i></td>"
+        f"<td><button class='detail-button' data-name='{escape(str(item['name']), quote=True)}' data-details='{escape(details, quote=True)}'>Подробнее</button></td></tr>"
+    )
+
+
 def render_culinary_strategy_html(strategy: dict[str, Any] | None) -> str:
     if strategy is None:
         return """
@@ -922,6 +1120,7 @@ def render_culinary_strategy_html(strategy: dict[str, Any] | None) -> str:
     future_orders = _render_future_orders(strategy["future_orders"])
     retrospective_orders = _render_retrospective_orders(strategy["retrospective_orders"])
     weather_sales = _render_weather_sales_summary(strategy["weather_sales_summary"])
+    rain_impact = strategy["rain_sales_impact"]
 
     return f"""
     <section class="workspace">
@@ -942,12 +1141,14 @@ def render_culinary_strategy_html(strategy: dict[str, Any] | None) -> str:
       <div class="category-strip">{category_cards}</div>
 
       <h2>Будущие заказы по датам</h2>
+      <div class="signal-box"><strong>Учет дождя: {rain_impact["applied_change_percent"]:+}% к общему потоку.</strong> Факт: {rain_impact["rain_sales_per_day"]} продаж/день в {rain_impact["rain_days"]} дождливых дней против {rain_impact["dry_sales_per_day"]} в {rain_impact["dry_days"]} сухих. Нормализованный коэффициент по дням недели: ×{rain_impact["observed_factor"]}; для заказа применяется безопасный коэффициент ×{rain_impact["applied_factor"]}.</div>
       <div class="future-orders">{future_orders}</div>
 
       <h2>Ретроспектива прошлой недели</h2>
       <div class="retrospective-orders">{retrospective_orders}</div>
 
       <h2>Спрос по погоде: {strategy["weather_city"]}</h2>
+      <p class="muted">Источник: {escape(str(strategy["weather_source"]))}; обновление: {escape(str(strategy["weather_updated_at"] or "нет данных"))}{"; используется сохраненный прогноз" if strategy["weather_stale"] else ""}</p>
       <div class="weather-summary">{weather_sales}</div>
 
       <div class="tabs">
@@ -981,6 +1182,7 @@ def _render_future_orders(periods: list[dict[str, object]]) -> str:
           <p class="muted">Продажи в таблице: прошлое сопоставимое окно {escape(str(period["previous_period"]))}</p>
           <p class="muted">{escape(str(period["shelf_life_mix"]))}</p>
           <p class="muted">{escape(str(period["weather"]))}</p>
+          <p class="muted"><strong>Дождь:</strong> общий клиентский поток ×{period["rain_traffic_factor"]}; внутри категорий сохраняется поправка на горячее и холодное меню.</p>
           <div class="daily-strip">{_render_daily_totals(period["daily_totals"])}</div>
           {_strategy_table(_render_future_rows(period["rows"]), "Продажи прошлого окна", "Списания прошлого окна", show_daily=True)}
         </details>
@@ -992,14 +1194,23 @@ def _render_future_orders(periods: list[dict[str, object]]) -> str:
 def _render_daily_totals(days: list[dict[str, object]]) -> str:
     return "".join(
         f"<div class='daily-card'><span>{escape(str(day['weekday']))}, {escape(str(day['date']))}</span>"
-        f"<strong>{day['quantity']} шт.</strong><small>{escape(str(day['weather']))}</small></div>"
+        f"<strong>{day['quantity']} шт.</strong><small>{escape(str(day['weather']))}</small>"
+        f"<small>{_daily_weather_effect(day)}</small></div>"
         for day in days
     )
 
 
+def _daily_weather_effect(day: dict[str, object]) -> str:
+    if not day.get("weather_available"):
+        return "Погодных данных нет — поправка не применяется"
+    prefix = "Дождь: поток " if day["rain"] else "Без осадков: поток "
+    return f"{prefix}×{day['traffic_factor']} ({day['weather_adjustment_percent']:+}%)"
+
+
 def _render_daily_forecast(days: list[dict[str, object]]) -> str:
     return "<br>".join(
-        f"<strong>{escape(str(day['weekday']))}: {day['quantity']} шт.</strong>"
+        f"<strong>{escape(str(day['weekday']))}: {day['quantity']} шт.</strong> "
+        f"<small>погода ×{day['weather_factor']}</small>"
         for day in days
     )
 
@@ -1012,7 +1223,7 @@ def _render_future_rows(items: list[dict[str, object]]) -> str:
           <td>{item["forecast_quantity"]} шт.</td>
           <td>{_render_daily_forecast(item["daily_forecast"])}</td>
           <td>{item["shelf_life_days"]} дн.</td>
-          <td>{item["previous_period_sales"]}<span>{escape(str(item["previous_period_label"]))}</span></td>
+          <td>{item["previous_period_sales"] if item["previous_period_sales"] is not None else "нет данных"}<span>{escape(str(item["previous_period_label"]))}</span></td>
           <td>{item["previous_period_waste"]}<span>{escape(str(item["previous_period_label"]))}</span></td>
           <td>{_render_risk_cell(item, _future_risk_context(item))}</td>
           <td>{_render_decision_cell(item)}</td>
@@ -1024,8 +1235,10 @@ def _render_future_rows(items: list[dict[str, object]]) -> str:
 
 def _future_risk_context(item: dict[str, object]) -> str:
     previous_waste = int(item.get("previous_period_waste", 0))
-    previous_sales = int(item.get("previous_period_sales", 0))
-    signals = [f"прошлое окно: продажи {previous_sales}, списания {previous_waste}"]
+    previous_sales_raw = item.get("previous_period_sales")
+    previous_sales = int(previous_sales_raw) if previous_sales_raw is not None else None
+    sales_signal = str(previous_sales) if previous_sales is not None else "нет данных"
+    signals = [f"прошлое окно: продажи {sales_signal}, списания {previous_waste}"]
     if previous_waste > 0:
         signals.append("свежий сигнал списаний: снижать запас или заменить SKU")
     signals.append(f"погодный коэффициент x{item['weather_factor']}")
@@ -1171,7 +1384,7 @@ def _risk_class(value: str) -> str:
     return "risk low"
 
 
-def render_dashboard_html(payload: dict[str, Any]) -> str:
+def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     events = payload["events"][:14]
     budget = payload["budget"]
     max_budget = max([*budget.values(), 1])
@@ -1203,7 +1416,11 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
     forecast_logic = "\n".join(f"<li>{item}</li>" for item in payload["forecast_logic"])
     next_data = "\n".join(f"<li>{item}</li>" for item in payload["next_data"])
     demand_factors = payload["demand_factors"]
-    culinary_strategy = render_culinary_strategy_html(payload.get("culinary_strategy"))
+    culinary_strategy = (
+        render_culinary_strategy_html(payload.get("culinary_strategy"))
+        if view == "analytics"
+        else render_orders_workspace(payload.get("culinary_strategy"))
+    )
 
     return f"""<!doctype html>
 <html lang="ru">
@@ -1244,6 +1461,9 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
       padding: 8px 0 18px;
       border-bottom: 1px solid var(--line);
     }}
+    nav {{ display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }}
+    nav a {{ color: var(--muted); text-decoration: none; padding: 7px 10px; border-radius: 7px; }}
+    nav a.active, nav a:hover {{ color: var(--green); background: var(--panel-soft); }}
     h1 {{ margin: 0; font-size: 30px; line-height: 1.1; }}
     h2 {{ margin: 0 0 12px; font-size: 18px; }}
     .muted {{ color: var(--muted); }}
@@ -1307,6 +1527,35 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
       line-height: 1.45;
     }}
     .workspace {{ margin-top: 16px; }}
+    .legacy-dashboard {{ display: none; }}
+    .eyebrow {{ display: block; color: var(--green); font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 5px; }}
+    .order-focus {{ padding: 22px; }}
+    .order-focus h2 {{ font-size: 25px; margin-bottom: 5px; }}
+    .order-total {{ min-width: 150px; padding: 14px 18px; border-radius: 10px; background: var(--green); color: white; display: grid; grid-template-columns: auto auto; align-items: baseline; gap: 0 8px; }}
+    .order-total span {{ grid-column: 1 / -1; font-size: 12px; opacity: .8; }}
+    .order-total strong {{ font-size: 36px; line-height: 1; }}
+    .order-total small {{ opacity: .8; }}
+    .alert-row {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 16px; }}
+    .alert-chip, .ok-chip {{ padding: 7px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; }}
+    .alert-chip {{ background: #f7e6bd; color: #775009; }}
+    .ok-chip {{ background: #dfece3; color: #28513d; }}
+    .table-wrap {{ overflow-x: auto; }}
+    .order-table th span, .order-table td span {{ display: block; color: var(--muted); font-size: 11px; margin-top: 3px; }}
+    .order-table .number {{ text-align: right; font-variant-numeric: tabular-nums; }}
+    .order-table .total-cell {{ font-weight: 800; color: var(--green); }}
+    .detail-button {{ border: 0; background: transparent; color: var(--green); cursor: pointer; font-weight: 700; padding: 6px; }}
+    .next-orders {{ margin-top: 16px; }}
+    .section-title {{ display: flex; justify-content: space-between; align-items: end; gap: 12px; }}
+    .next-order-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }}
+    .next-order-card {{ display: grid; gap: 7px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; text-decoration: none; color: var(--ink); background: #fbfaf7; }}
+    .next-order-card:hover {{ border-color: var(--green); }}
+    .next-order-card strong {{ font-size: 23px; color: var(--green); }}
+    .next-order-card small {{ color: var(--muted); line-height: 1.35; }}
+    dialog {{ width: min(480px, calc(100% - 24px)); height: 100%; max-height: none; margin: 0 0 0 auto; border: 0; padding: 42px 24px 24px; box-shadow: -12px 0 40px #0003; }}
+    dialog::backdrop {{ background: #17201a66; }}
+    .dialog-close {{ position: absolute; right: 16px; top: 12px; border: 0; background: transparent; font-size: 28px; cursor: pointer; }}
+    #dialog-content h2 {{ font-size: 22px; }}
+    #dialog-content p {{ white-space: pre-line; line-height: 1.6; color: var(--muted); }}
     .workspace-head {{
       display: flex;
       justify-content: space-between;
@@ -1465,7 +1714,7 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
     @media (max-width: 820px) {{
       main {{ width: min(100% - 20px, 680px); padding-top: 16px; }}
       header {{ align-items: start; flex-direction: column; }}
-      .grid, .metrics, .category-strip {{ grid-template-columns: 1fr; }}
+      .grid, .metrics, .category-strip, .next-order-grid {{ grid-template-columns: 1fr; }}
       .workspace-head {{ flex-direction: column; }}
       .tabs {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .tabs label {{ text-align: center; }}
@@ -1480,12 +1729,14 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
       <div>
         <h1>Заказы кулинарии</h1>
         <div class="muted">Обеды, салаты, роллы и горячие блюда на ближайшие периоды</div>
+        <nav><a class="{'active' if view == 'orders' else ''}" href="/">Заказы</a><a class="{'active' if view == 'analytics' else ''}" href="/analytics">Аналитика</a><a href="/reports">Отчёты</a><a href="/settings">Настройки</a></nav>
       </div>
       <div><a href="/reports">Ежемесячные отчеты</a><div class="muted">{payload["start_day"]} · {payload["horizon_days"]} дней</div></div>
     </header>
 
     {culinary_strategy}
 
+    <div class="legacy-dashboard">
     <div class="metrics">
       <div class="metric"><span>Сумма заказов</span><strong>{_format_money(payload["budget_total"])} ₽</strong></div>
       <div class="metric"><span>Цикл заказа</span><strong>{payload["order_cycle_days"]} дня</strong></div>
@@ -1531,24 +1782,61 @@ def render_dashboard_html(payload: dict[str, Any]) -> str:
         <ul>{next_data}</ul>
       </section>
     </div>
+    </div>
   </main>
+  <script>
+    const dialog = document.getElementById('item-dialog');
+    document.querySelectorAll('.detail-button').forEach(button => button.addEventListener('click', () => {{
+      const content = document.getElementById('dialog-content');
+      content.replaceChildren();
+      const label = document.createElement('span'); label.className = 'eyebrow'; label.textContent = 'Детали позиции';
+      const title = document.createElement('h2'); title.textContent = button.dataset.name;
+      const details = document.createElement('p'); details.textContent = button.dataset.details;
+      content.append(label, title, details);
+      dialog.showModal();
+    }}));
+    document.querySelector('.dialog-close')?.addEventListener('click', () => dialog.close());
+    dialog?.addEventListener('click', event => {{ if (event.target === dialog) dialog.close(); }});
+  </script>
 </body>
 </html>"""
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/health":
+            self._send_json({"status": "ok"})
+            return
+        if parsed.path == "/setup":
+            params = parse_qs(parsed.query)
+            self._send_html(render_setup_html(params.get("error", [""])[0], params.get("message", [""])[0]))
+            return
+        if parsed.path == "/api/setup/status":
+            self._send_json(
+                {
+                    "configured": has_database_config(),
+                    "config_path": str(appdata_env_path()),
+                    "storage": REPORT_STORAGE.storage_label(),
+                }
+            )
+            return
         if not self._authorize():
             return
-        parsed = urlparse(self.path)
         if parsed.path == "/":
             self._send_html(render_dashboard_html(_payload_from_query(parsed.query)))
             return
         if parsed.path == "/api/dashboard":
             self._send_json(_payload_from_query(parsed.query))
             return
-        if parsed.path == "/health":
-            self._send_json({"status": "ok"})
+        if parsed.path == "/api/data-status":
+            self._send_json(build_data_status())
+            return
+        if parsed.path == "/analytics":
+            self._send_html(render_dashboard_html(_payload_from_query(parsed.query), view="analytics"))
+            return
+        if parsed.path == "/settings":
+            self._send_html(render_settings_html())
             return
         if parsed.path == "/reports":
             params = parse_qs(parsed.query)
@@ -1557,14 +1845,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/reports/files/"):
             self._send_report_file(parsed.path.rsplit("/", 1)[-1])
             return
-        self.send_error(HTTPStatus.NOT_FOUND, "Страница не найдена")
+        self._send_error_page(HTTPStatus.NOT_FOUND, "Страница не найдена")
 
     def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/setup":
+            if has_database_config() and not self._authorize():
+                return
+            fields = self._read_form_urlencoded()
+            try:
+                save_setup_config(fields)
+            except AppConfigError as error:
+                self._send_html(render_setup_html(error=str(error), values=fields))
+                return
+            self._redirect(f"/reports?message={_url_quote('Настройки сохранены')}")
+            return
         if not self._authorize():
             return
-        parsed = urlparse(self.path)
         if parsed.path != "/reports/upload":
-            self.send_error(HTTPStatus.NOT_FOUND, "Страница не найдена")
+            self._send_error_page(HTTPStatus.NOT_FOUND, "Страница не найдена")
             return
         try:
             report = self._read_upload()
@@ -1572,6 +1871,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._redirect(f"/reports?error={_url_quote(str(error))}")
             return
         self._redirect(f"/reports?message={_url_quote(f'Загружен отчет {report.original_name}')}")
+
+    def _read_form_urlencoded(self) -> dict[str, str]:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = 0
+        body = self.rfile.read(content_length).decode("utf-8", errors="replace")
+        parsed = parse_qs(body, keep_blank_values=True)
+        return {key: values[0] if values else "" for key, values in parsed.items()}
 
     def _read_upload(self):
         try:
@@ -1602,7 +1910,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _send_report_file(self, report_id: str) -> None:
         resolved = REPORT_STORAGE.resolve(report_id)
         if resolved is None:
-            self.send_error(HTTPStatus.NOT_FOUND, "Отчет не найден")
+            self._send_error_page(HTTPStatus.NOT_FOUND, "Отчет не найден")
             return
         report, path = resolved
         content = path.read_bytes()
@@ -1621,7 +1929,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not username and not password:
             return True
         if not username or not password:
-            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Авторизация настроена не полностью")
+            self._send_error_page(HTTPStatus.INTERNAL_SERVER_ERROR, "Авторизация настроена не полностью")
             return False
         expected = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
         if hmac.compare_digest(self.headers.get("Authorization", ""), expected):
@@ -1662,6 +1970,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _send_error_page(self, status: HTTPStatus, message: str) -> None:
+        content = f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{status.value}</title><style>
+body{{font-family:Arial,sans-serif;background:#f5f6f8;color:#17202a;margin:0}}main{{max-width:760px;margin:40px auto;padding:0 20px}}
+section{{background:white;border-radius:14px;padding:22px;box-shadow:0 4px 18px #00000010}}a{{color:#176b55}}
+</style></head><body><main><section><h1>{status.value}</h1><p>{escape(message)}</p><p><a href="/">Вернуться к прогнозу</a></p></section></main></body></html>"""
+        encoded = content.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
     def _send_json(self, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(HTTPStatus.OK)
@@ -1670,6 +1995,89 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+
+def build_data_status(storage: Any | None = None) -> dict[str, Any]:
+    active_storage = storage or REPORT_STORAGE
+    reports = active_storage.list()
+    counts = {"sales": 0, "waste": 0}
+    readable_counts = {"sales": 0, "waste": 0}
+    rows = []
+
+    for report in reports:
+        if report.report_type in counts:
+            counts[report.report_type] += 1
+        try:
+            resolved = active_storage.resolve(report.id)
+        except Exception:
+            resolved = None
+        readable = resolved is not None
+        if readable and report.report_type in readable_counts:
+            readable_counts[report.report_type] += 1
+        rows.append(
+            {
+                "id": report.id,
+                "type": report.report_type,
+                "type_label": ALLOWED_REPORT_TYPES.get(report.report_type, report.report_type),
+                "period": f"{report.period_start} — {report.period_end}",
+                "period_start": report.period_start,
+                "period_end": report.period_end,
+                "original_name": report.original_name,
+                "size": report.size,
+                "readable": readable,
+                "status": "доступен" if readable else "ошибка чтения",
+            }
+        )
+
+    sales_ready = readable_counts["sales"] > 0
+    waste_ready = readable_counts["waste"] > 0
+    if sales_ready and waste_ready:
+        summary = "Продажи участвуют в расчете, списания учитываются."
+    elif sales_ready:
+        summary = "Продажи участвуют в расчете, списания пока не учитываются."
+    else:
+        summary = "Для прогноза нужно загрузить читаемый отчет продаж."
+
+    return {
+        "storage": active_storage.storage_label(),
+        "counts": counts,
+        "readable_counts": readable_counts,
+        "sales_ready": sales_ready,
+        "waste_ready": waste_ready,
+        "forecast_ready": sales_ready,
+        "summary": summary,
+        "reports": rows,
+    }
+
+
+def _count_label(value: int) -> str:
+    if value % 10 == 1 and value % 100 != 11:
+        return f"{value} файл"
+    if value % 10 in {2, 3, 4} and value % 100 not in {12, 13, 14}:
+        return f"{value} файла"
+    return f"{value} файлов"
+
+
+def render_data_status_block(status: dict[str, Any]) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{escape(str(item['type_label']))}</td>"
+        f"<td>{escape(str(item['period']))}</td>"
+        f"<td>{escape(str(item['original_name']))}</td>"
+        f"<td>{escape(str(item['status']))}</td>"
+        "</tr>"
+        for item in status["reports"]
+    ) or "<tr><td colspan='4'>Файлы для расчета пока не загружены.</td></tr>"
+    ready_class = "ok" if status["forecast_ready"] else "error"
+    sales_count = _count_label(int(status["counts"]["sales"]))
+    waste_count = _count_label(int(status["counts"]["waste"]))
+    return f"""
+<section>
+  <h2>Используется в расчете</h2>
+  <p class="{ready_class}">{escape(str(status["summary"]))}</p>
+  <p class="muted">Хранилище: {escape(str(status["storage"]))}. Продажи: {sales_count}. Списания: {waste_count}.</p>
+  <table><thead><tr><th>Тип</th><th>Период</th><th>Файл</th><th>Статус</th></tr></thead><tbody>{rows}</tbody></table>
+</section>"""
 
 
 def render_reports_html(message: str = "", error: str = "") -> str:
@@ -1682,12 +2090,14 @@ def render_reports_html(message: str = "", error: str = "") -> str:
     ) or "<tr><td colspan='5'>Загруженных отчетов пока нет.</td></tr>"
     notice = f"<p class='ok'>{escape(message)}</p>" if message else ""
     failure = f"<p class='error'>{escape(error)}</p>" if error else ""
+    storage_info = f"<p class='muted'>Хранилище: {escape(REPORT_STORAGE.storage_label())}</p>"
+    notice = storage_info + notice + render_data_status_block(build_data_status())
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Ежемесячные отчеты</title><style>
 body{{font-family:Arial,sans-serif;background:#f5f6f8;color:#17202a;margin:0}}main{{max-width:1100px;margin:30px auto;padding:0 20px}}
 section{{background:white;border-radius:14px;padding:22px;margin:18px 0;box-shadow:0 4px 18px #00000010}}label{{display:block;margin:12px 0 5px}}
-input,select,button{{font:inherit;padding:10px}}button{{background:#176b55;color:white;border:0;border-radius:8px;cursor:pointer}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:left}}.ok{{color:#176b55}}.error{{color:#b42318}}a{{color:#176b55}}
+input,select,button{{font:inherit;padding:10px}}button{{background:#176b55;color:white;border:0;border-radius:8px;cursor:pointer}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:left}}.ok{{color:#176b55}}.error{{color:#b42318}}.muted{{color:#607069}}a{{color:#176b55}}
 </style></head><body><main><p><a href="/">← К прогнозу</a></p><h1>Ежемесячная отчетность</h1>
 {notice}{failure}<section><h2>Загрузить файл</h2><form method="post" action="/reports/upload" enctype="multipart/form-data">
 <label for="report_type">Тип отчета</label><select id="report_type" name="report_type"><option value="sales">Продажи</option><option value="waste">Списания</option></select>
@@ -1697,14 +2107,89 @@ input,select,button{{font:inherit;padding:10px}}button{{background:#176b55;color
 </main></body></html>"""
 
 
+def reload_report_storage() -> None:
+    global REPORT_STORAGE
+    REPORT_STORAGE = create_report_storage()
+
+
+def save_setup_config(values: dict[str, str]) -> Path:
+    prepared = {
+        "SUPABASE_URL": values.get("SUPABASE_URL", ""),
+        "SUPABASE_SERVICE_ROLE_KEY": values.get("SUPABASE_SERVICE_ROLE_KEY", ""),
+        "SUPABASE_STORAGE_BUCKET": values.get("SUPABASE_STORAGE_BUCKET", "") or "uploads",
+        "APP_USERNAME": values.get("APP_USERNAME", ""),
+        "APP_PASSWORD": values.get("APP_PASSWORD", ""),
+        "APP_PORT": os.getenv("APP_PORT", "8000"),
+    }
+    path = write_appdata_env(prepared)
+    reload_report_storage()
+    return path
+
+
+def render_setup_html(error: str = "", message: str = "", values: dict[str, str] | None = None) -> str:
+    values = values or {}
+    notice = f"<p class='ok'>{escape(message)}</p>" if message else ""
+    failure = f"<p class='error'>{escape(error)}</p>" if error else ""
+    supabase_url = escape(values.get("SUPABASE_URL", os.getenv("SUPABASE_URL", "")))
+    bucket = escape(values.get("SUPABASE_STORAGE_BUCKET", os.getenv("SUPABASE_STORAGE_BUCKET", "uploads") or "uploads"))
+    username = escape(values.get("APP_USERNAME", os.getenv("APP_USERNAME", "")))
+    configured = "подключена" if has_database_config() else "не настроена"
+    config_path = escape(str(appdata_env_path()))
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Первичная настройка</title><style>
+body{{font-family:Arial,sans-serif;background:#f5f6f8;color:#17202a;margin:0}}main{{max-width:860px;margin:30px auto;padding:0 20px}}
+section{{background:white;border-radius:14px;padding:22px;margin:18px 0;box-shadow:0 4px 18px #00000010}}label{{display:block;margin:14px 0 5px}}
+input,button{{font:inherit;padding:10px;box-sizing:border-box}}input{{width:100%;max-width:680px}}button{{background:#176b55;color:white;border:0;border-radius:8px;cursor:pointer}}.ok{{color:#176b55}}.error{{color:#b42318}}.muted{{color:#607069}}a{{color:#176b55}}
+</style></head><body><main><h1>Первичная настройка</h1>
+<section>
+  <p class="muted">База данных сейчас: {configured}. Настройки будут сохранены в {config_path}.</p>
+  {notice}{failure}
+  <form method="post" action="/setup">
+    <label for="SUPABASE_URL">URL проекта Supabase</label>
+    <input id="SUPABASE_URL" name="SUPABASE_URL" value="{supabase_url}" placeholder="https://example.supabase.co" required>
+    <label for="SUPABASE_SERVICE_ROLE_KEY">Secret key Supabase</label>
+    <input id="SUPABASE_SERVICE_ROLE_KEY" name="SUPABASE_SERVICE_ROLE_KEY" type="password" autocomplete="new-password" required>
+    <label for="SUPABASE_STORAGE_BUCKET">Bucket для отчетов</label>
+    <input id="SUPABASE_STORAGE_BUCKET" name="SUPABASE_STORAGE_BUCKET" value="{bucket}" placeholder="uploads">
+    <label for="APP_USERNAME">Логин для входа в сервис</label>
+    <input id="APP_USERNAME" name="APP_USERNAME" value="{username}" placeholder="manager">
+    <label for="APP_PASSWORD">Пароль для входа в сервис</label>
+    <input id="APP_PASSWORD" name="APP_PASSWORD" type="password" autocomplete="new-password">
+    <p><button type="submit">Сохранить настройки</button></p>
+  </form>
+</section>
+<section><p><a href="/reports">Перейти к отчетам</a></p></section>
+</main></body></html>"""
+
+
+def render_settings_html() -> str:
+    return """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Настройки прогноза</title><style>
+body{font-family:Inter,Segoe UI,Arial,sans-serif;background:#f6f2ec;color:#20231f;margin:0}main{max-width:820px;margin:30px auto;padding:0 20px}
+section{background:white;border:1px solid #ded8ce;border-radius:10px;padding:22px;margin:18px 0}dt{font-weight:700;margin-top:14px}dd{margin:4px 0;color:#687069}a{color:#365f4c}
+</style></head><body><main><p><a href="/">← Заказы</a> · <a href="/analytics">Аналитика</a> · <a href="/reports">Отчёты</a></p>
+<h1>Настройки</h1><section><h2>Текущая конфигурация</h2><dl>
+<dt>Город</dt><dd>Санкт-Петербург, 59.9343 / 30.3351</dd>
+<dt>Погода</dt><dd>MET Norway, обновление раз в 180 минут</dd>
+<dt>Расписание заказов</dt><dd>Пн+Вт, Ср+Чт, Пт+Сб+Вс</dd>
+<dt>Отсутствующие значения</dt><dd>Не считаются нулевыми продажами</dd>
+</dl><p>Изменяемые настройки будут добавлены после проверки нового рабочего экрана.</p></section></main></body></html>"""
+
+
 def _url_quote(value: str) -> str:
     from urllib.parse import quote
 
     return quote(value)
 
 
+def server_port() -> int:
+    return int(os.getenv("PORT", os.getenv("APP_PORT", "8000")))
+
+
 def run_server() -> None:
-    port = int(os.getenv("APP_PORT", "8000"))
+    port = server_port()
     server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
     print(json.dumps({"level": "info", "event": "server_started", "port": port}))
     server.serve_forever()

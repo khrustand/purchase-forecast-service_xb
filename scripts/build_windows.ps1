@@ -1,0 +1,54 @@
+param(
+    [switch]$InstallPyInstaller
+)
+
+$ErrorActionPreference = "Stop"
+
+$projectRoot = Split-Path -Parent $PSScriptRoot
+Set-Location $projectRoot
+
+$pythonCandidates = @(
+    (Join-Path $env:LOCALAPPDATA "Python\pythoncore-3.14-64\python.exe"),
+    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python314\python.exe"),
+    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\python.exe"),
+    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe")
+)
+$PythonExe = $pythonCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (-not $PythonExe) {
+    $PythonExe = "py"
+}
+
+function Test-PyInstaller {
+    try {
+        & $PythonExe -m PyInstaller --version *> $null
+        return $LASTEXITCODE -eq 0
+    }
+    catch {
+        return $false
+    }
+}
+
+if (-not (Test-PyInstaller)) {
+    if (-not $InstallPyInstaller) {
+        Write-Host "PyInstaller is not installed."
+        Write-Host "Run: powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1 -InstallPyInstaller"
+        exit 2
+    }
+    & $PythonExe -m pip install pyinstaller
+}
+
+& $PythonExe -m PyInstaller `
+    --noconfirm `
+    --clean `
+    --onefile `
+    --name purchase-forecast-service `
+    --collect-submodules src `
+    --collect-submodules scripts `
+    src\app\windows_launcher.py
+
+Copy-Item -LiteralPath .env.example -Destination dist\.env.example -Force
+
+Write-Host "Windows app built: dist\purchase-forecast-service.exe"
+Write-Host "First launch opens http://localhost:8000/setup if Supabase settings are missing."
+Write-Host "Saved settings path: %APPDATA%\purchase-forecast-service\.env"
+Write-Host "Optional portable override: place .env next to the exe."

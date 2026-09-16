@@ -3,16 +3,29 @@ services:
     build:
       context: .
     environment:
-      APP_ENV: local
-      APP_NAME: purchase-forecast-service
-      APP_PORT: 8000
-      LOG_LEVEL: debug
-      TZ: Europe/Moscow
-      REPORT_UPLOAD_DIR: /app/data/uploads
+      APP_ENV: ${APP_ENV:-local}
+      APP_NAME: ${APP_NAME:-purchase-forecast-service}
+      APP_PORT: ${APP_PORT:-8000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TZ: ${TZ:-Europe/Moscow}
+      REPORT_UPLOAD_DIR: ${REPORT_UPLOAD_DIR:-data/uploads}
       APP_USERNAME: ${APP_USERNAME:-}
       APP_PASSWORD: ${APP_PASSWORD:-}
+      WEATHER_PROVIDER: ${WEATHER_PROVIDER:-met-no}
+      WEATHER_LATITUDE: ${WEATHER_LATITUDE:-59.9343}
+      WEATHER_LONGITUDE: ${WEATHER_LONGITUDE:-30.3351}
+      WEATHER_TIMEZONE: ${WEATHER_TIMEZONE:-Europe/Moscow}
+      WEATHER_CACHE_PATH: ${WEATHER_CACHE_PATH:-data/uploads/met_norway_forecast.json}
+      WEATHER_CACHE_TTL_MINUTES: ${WEATHER_CACHE_TTL_MINUTES:-180}
+      WEATHER_USER_AGENT: ${WEATHER_USER_AGENT:-purchase-forecast-service/1.0 github.com/khrustand/purchase-forecast-service_xb}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      SUPABASE_STORAGE_BUCKET: ${SUPABASE_STORAGE_BUCKET:-uploads}
+      DATABASE_URL: ${DATABASE_URL:-}
     ports:
-      - "8000:8000"
+      - "${APP_PORT:-8000}:${APP_PORT:-8000}"
     volumes:
       - ./data/examples:/app/data/examples:ro
       - ./data/local:/app/data/local:ro

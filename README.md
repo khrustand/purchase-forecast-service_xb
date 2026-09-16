@@ -1,5 +1,7 @@
 # Сервис заказов кулинарии
 
+Для ежедневной работы начните с короткой инструкции: [Как пользоваться сервисом](docs/how-to-use.md).
+
 Локальный сервис для формирования заказов кулинарии в кофейню: обеды, салаты, роллы, супы, горячие блюда и похожие позиции. Другие товарные группы сейчас не рассматриваются.
 
 Главная задача MVP - по списку позиций и заказам за прошлые периоды собрать понятную рекомендацию: сколько заказать на ближайшие 2 дня, где есть риск нехватки, где вероятны списания и какие позиции требуют ручной проверки.
@@ -20,6 +22,8 @@
 ```powershell
 python -m venv .venv
 python -m unittest
+Copy-Item .env.example .env
+# Заменить APP_PASSWORD в .env перед первым запуском.
 docker compose up --build
 ```
 
@@ -52,6 +56,22 @@ http://localhost:8000/reports
 | `APP_PASSWORD` | Пароль Basic Auth | случайный длинный пароль | для внешнего доступа | авторизация выключена |
 | `REPORT_UPLOAD_DIR` | Каталог загруженных XLSX | `data/uploads` | нет | `data/uploads` |
 | `TZ` | Часовой пояс | `Europe/Moscow` | нет | системный |
+| `WEATHER_PROVIDER` | Провайдер актуального прогноза | `met-no` | нет | `off` |
+| `WEATHER_LATITUDE` | Широта точки прогноза | `59.9343` | при включенной погоде | Санкт-Петербург |
+| `WEATHER_LONGITUDE` | Долгота точки прогноза | `30.3351` | при включенной погоде | Санкт-Петербург |
+| `WEATHER_TIMEZONE` | Часовой пояс агрегации прогноза | `Europe/Moscow` | нет | `Europe/Moscow` |
+| `WEATHER_CACHE_PATH` | Файл кэша MET Norway | `data/uploads/met_norway_forecast.json` | нет | в каталоге загрузок |
+| `WEATHER_CACHE_TTL_MINUTES` | Интервал обновления прогноза | `180` | нет | `180` |
+| `WEATHER_USER_AGENT` | Идентификатор приложения для MET Norway | имя приложения и URL репозитория | да | идентификатор проекта |
+| `STORAGE_BACKEND` | Где хранить загруженные отчеты | `local` или `supabase` | нет | `local` |
+| `SUPABASE_URL` | URL проекта Supabase | `https://bzwnnccqlbmlxigyrmhy.supabase.co` | для облачного режима | нет |
+| `SUPABASE_ANON_KEY` | Publishable key Supabase | `sb_publishable_...` | для облачного режима | нет |
+| `SUPABASE_SERVICE_ROLE_KEY` | Secret key Supabase для backend | `sb_secret_...` | для облачного режима | нет |
+| `SUPABASE_STORAGE_BUCKET` | Bucket для XLSX-файлов | `uploads` | для облачного режима | `uploads` |
+| `DATABASE_URL` | Строка подключения к Supabase Postgres | `postgresql://...` | для облачного режима | нет |
+
+Локальные значения хранятся в `.env`. Файл исключен из Git; в репозиторий входит только безопасный шаблон `.env.example`. Для Render значения `APP_USERNAME` и `APP_PASSWORD` из локального файла добавляются вручную как Secret-переменные.
+Ключи `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` и `DATABASE_URL` нельзя отправлять в чат и нельзя коммитить; их нужно хранить только в локальном `.env` и в Render Environment Variables.
 
 ## Команды разработки
 
@@ -103,6 +123,8 @@ http://localhost:8000/reports
 
 ## Документация
 
+- Простая пользовательская инструкция: [docs/how-to-use.md](docs/how-to-use.md).
+
 - Сценарии продукта: [docs/product-scenarios.md](docs/product-scenarios.md).
 - Модель заказов кулинарии: [docs/culinary-order-model.md](docs/culinary-order-model.md).
 - Веб-панель: [docs/web-dashboard.md](docs/web-dashboard.md).
@@ -117,3 +139,57 @@ http://localhost:8000/reports
 | Заказ завышен | Добавить остатки и списания. |
 | Не видно риска нехватки | Добавить минимальный остаток и кратность заказа. |
 | Не открывается веб-панель | Проверить `docker compose ps` и порт `APP_PORT`. |
+
+## Supabase
+
+Для облачного режима нужно один раз выполнить SQL из файла `supabase/migrations/001_uploaded_reports.sql` в Supabase SQL Editor и создать private bucket `uploads`.
+
+После этого можно включить хранение отчетов в Supabase:
+
+```env
+STORAGE_BACKEND=supabase
+```
+
+В этом режиме оригинальные XLSX-файлы хранятся в Supabase Storage, а реестр загрузок хранится в таблице `uploaded_reports`. Расчетная модель продолжает читать файлы через тот же интерфейс, поэтому локальный режим остается запасным вариантом.
+
+Если Supabase Storage обрывает загрузку большого XLSX, сервис сохраняет файл в таблицу `uploaded_report_chunks` небольшими частями и затем собирает его обратно при расчете. Для этого после `001_uploaded_reports.sql` нужно выполнить миграцию `supabase/migrations/002_uploaded_report_chunks.sql`.
+
+## Облачный веб-запуск без Docker
+
+Для работы независимо от компьютера сервис размещается как Render Python Web Service:
+
+```text
+GitHub -> Render Python Web Service -> Supabase
+```
+
+Render запускает приложение командой:
+
+```powershell
+python -m src.app.web_server
+```
+
+Постоянные данные остаются в Supabase, поэтому ноутбук в пекарне открывает только веб-адрес сервиса. Подробная инструкция: [docs/external-deployment.md](docs/external-deployment.md).
+
+## Windows-приложение
+
+Первый Windows-выпуск работает как локальное веб-приложение: запускается `purchase-forecast-service.exe`, поднимает сервер на `http://localhost:8000` и открывает браузер.
+
+Сборка:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1 -InstallPyInstaller
+```
+
+Готовый файл:
+
+```text
+dist\purchase-forecast-service.exe
+```
+
+При первом запуске exe сам откроет страницу `http://localhost:8000/setup`. На ней нужно один раз указать Supabase URL, secret key, bucket `uploads` и при необходимости логин/пароль входа в сервис. Настройки сохраняются локально:
+
+```text
+%APPDATA%\purchase-forecast-service\.env
+```
+
+Если рядом с exe положить `.env`, он будет иметь приоритет над AppData-настройками. Это удобно для переносного режима, но реальные ключи Supabase и пароль панели нельзя коммитить и нельзя отправлять в чат.

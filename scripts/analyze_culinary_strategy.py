@@ -141,8 +141,9 @@ def extract_items(rows: list[list[str | None]], start: date, end: date) -> list[
             continue
 
         by_date = {
-            day: number(row[index] if index < len(row) else None)
+            day: number(row[index])
             for index, day in date_columns
+            if index < len(row) and row[index] is not None and str(row[index]).strip() != ""
         }
         if sum(by_date.values()) <= 0:
             continue

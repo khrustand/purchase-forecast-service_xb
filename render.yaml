@@ -1,24 +1,47 @@
 services:
   - type: web
     name: purchase-forecast-service
-    runtime: docker
+    runtime: python
     plan: starter
-    dockerfilePath: ./Dockerfile
+    buildCommand: python -m unittest
+    startCommand: python -m src.app.web_server
     healthCheckPath: /health
     envVars:
       - key: APP_ENV
         value: production
-      - key: APP_PORT
+      - key: PORT
         value: 10000
       - key: TZ
         value: Europe/Moscow
       - key: REPORT_UPLOAD_DIR
-        value: /app/data/uploads
+        value: data/uploads
+      - key: WEATHER_PROVIDER
+        value: met-no
+      - key: WEATHER_LATITUDE
+        value: 59.9343
+      - key: WEATHER_LONGITUDE
+        value: 30.3351
+      - key: WEATHER_TIMEZONE
+        value: Europe/Moscow
+      - key: WEATHER_CACHE_PATH
+        value: data/uploads/met_norway_forecast.json
+      - key: WEATHER_CACHE_TTL_MINUTES
+        value: 180
+      - key: WEATHER_USER_AGENT
+        value: purchase-forecast-service/1.0 github.com/khrustand/purchase-forecast-service_xb
+      - key: STORAGE_BACKEND
+        value: supabase
+      - key: SUPABASE_URL
+        value: https://bzwnnccqlbmlxigyrmhy.supabase.co
+      - key: SUPABASE_STORAGE_BUCKET
+        value: uploads
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
       - key: APP_USERNAME
         sync: false
       - key: APP_PASSWORD
         sync: false
-    disk:
-      name: monthly-reports
-      mountPath: /app/data/uploads
-      sizeGB: 1

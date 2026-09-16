@@ -2,44 +2,96 @@
 
 ## Назначение
 
-Сервис подготовлен к размещению как закрытая веб-панель с загрузкой ежемесячных XLSX-отчетов. Для постоянного хранения файлов нужен хостинг с persistent disk.
+Сервис должен работать независимо от ноутбука в пекарне. Ноутбук, телефон или другое устройство открывают веб-адрес в браузере, а приложение постоянно работает на внешнем хостинге.
 
-## Рекомендованный вариант
+## Рекомендуемая схема
 
-В репозитории есть `render.yaml` для Render Web Service:
+```text
+GitHub
+  хранит код проекта
 
-- Docker-сборка;
-- проверка состояния по `/health`;
-- диск `/app/data/uploads` размером 1 ГБ;
-- HTTP Basic Authentication;
-- московский часовой пояс.
+Render Python Web Service
+  запускает python -m src.app.web_server
+  отдает веб-интерфейс
 
-Persistent disk требует платного экземпляра Render. Без диска загруженные файлы исчезнут после перезапуска или нового деплоя.
+Supabase
+  хранит XLSX-файлы, список загруженных отчетов и резервные chunks
+```
 
-## Развертывание
+Docker остается только для локальной разработки. В облаке сервис запускается как обычное Python-приложение без контейнера.
 
-1. Опубликовать репозиторий в приватном GitHub/GitLab-репозитории.
-2. В Render создать Blueprint и указать путь `projects/purchase-forecast-service/render.yaml`.
-3. Задать секреты `APP_USERNAME` и `APP_PASSWORD`.
-4. Проверить `/health`, затем открыть `/reports`.
-5. Загрузить отчеты продаж и списаний по месяцам.
+## Что уже подготовлено
 
-## Переменные окружения
+- `render.yaml` настроен как `runtime: python`.
+- Команда сборки: `python -m unittest`.
+- Команда запуска: `python -m src.app.web_server`.
+- Healthcheck: `/health`.
+- Сервер поддерживает переменную `PORT`, которую выдает Render.
+- Данные отчетов читаются из Supabase при `STORAGE_BACKEND=supabase`.
 
-| Имя | Назначение | Пример | Обязательность | По умолчанию |
-| --- | --- | --- | --- | --- |
-| `APP_PORT` | HTTP-порт | `10000` | да в облаке | `8000` |
-| `APP_USERNAME` | Логин панели | `manager` | да для внешнего доступа | авторизация отключена |
-| `APP_PASSWORD` | Пароль панели | длинный случайный пароль | да для внешнего доступа | авторизация отключена |
-| `REPORT_UPLOAD_DIR` | Постоянное хранилище XLSX | `/app/data/uploads` | да в облаке | `data/uploads` |
-| `TZ` | Часовой пояс дат заказа | `Europe/Moscow` | нет | системный |
+## Переменные окружения Render
 
-## Резервное копирование
+В Render нужно задать:
 
-Скачивать загруженные книги можно на странице `/reports`. Дополнительно следует использовать ежедневные снимки диска хостинга. Исходные отчеты нельзя хранить только внутри контейнера.
+```env
+APP_ENV=production
+PORT=10000
+TZ=Europe/Moscow
+
+APP_USERNAME=<логин для входа>
+APP_PASSWORD=<пароль для входа>
+
+STORAGE_BACKEND=supabase
+SUPABASE_URL=<url проекта Supabase>
+SUPABASE_ANON_KEY=<publishable key>
+SUPABASE_SERVICE_ROLE_KEY=<secret key>
+SUPABASE_STORAGE_BUCKET=uploads
+DATABASE_URL=<строка подключения Postgres>
+
+WEATHER_PROVIDER=met-no
+WEATHER_LATITUDE=59.9343
+WEATHER_LONGITUDE=30.3351
+WEATHER_TIMEZONE=Europe/Moscow
+WEATHER_CACHE_PATH=data/uploads/met_norway_forecast.json
+WEATHER_CACHE_TTL_MINUTES=180
+WEATHER_USER_AGENT=purchase-forecast-service/1.0 github.com/khrustand/purchase-forecast-service_xb
+```
+
+Секреты нельзя коммитить и нельзя отправлять в чат. В Render для них нужно использовать secret environment variables.
+
+## Порядок размещения
+
+1. Запушить актуальный код в GitHub.
+2. В Render создать новый Blueprint или Web Service из репозитория.
+3. Использовать `render.yaml`.
+4. Добавить secret-переменные:
+   - `APP_USERNAME`
+   - `APP_PASSWORD`
+   - `SUPABASE_ANON_KEY`
+   - `SUPABASE_SERVICE_ROLE_KEY`
+   - `DATABASE_URL`
+5. Дождаться успешной сборки.
+6. Проверить `/health`.
+7. Открыть `/reports` и убедиться, что блок "Используется в расчете" показывает Supabase, 2 файла продаж и 2 файла списаний.
+
+## Supabase
+
+Перед облачным запуском должны быть выполнены миграции:
+
+```text
+supabase/migrations/001_uploaded_reports.sql
+supabase/migrations/002_uploaded_report_chunks.sql
+```
+
+Также должен существовать private bucket:
+
+```text
+uploads
+```
 
 ## Ограничения
 
-- Один persistent disk подключается к одному экземпляру приложения.
-- Текущая версия использует файловый реестр; горизонтальное масштабирование не поддерживается.
-- Для нескольких пользователей с разными ролями потребуется отдельная система учетных записей и база данных.
+- На бесплатных тарифах Render сервис может засыпать после неактивности.
+- Supabase Free подходит для MVP, но проект может быть поставлен на паузу при долгой неактивности.
+- Сейчас авторизация простая: HTTP Basic Auth через `APP_USERNAME` и `APP_PASSWORD`.
+- Локальный cache `data/uploads` не является постоянным хранилищем в облаке; постоянные данные должны оставаться в Supabase.
