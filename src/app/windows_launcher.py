@@ -9,6 +9,7 @@ import webbrowser
 from collections.abc import Callable, Sequence
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from shutil import which
 
 from src.infrastructure.app_config import has_database_config, load_env_file, load_runtime_env
 
@@ -23,12 +24,45 @@ def open_windows_app_window(
     url: str,
     popen: Callable[[Sequence[str]], object] = subprocess.Popen,
     fallback: Callable[[str], object] = webbrowser.open,
+    edge_executable: Callable[[], Path | None] = lambda: find_edge_executable(),
 ) -> object | None:
+    profile_dir = Path(os.getenv("LOCALAPPDATA", str(runtime_base_dir()))) / "PurchaseForecastService" / "edge-profile"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    executable = edge_executable()
+    if executable is None:
+        fallback(url)
+        return None
     try:
-        return popen(["msedge", f"--app={url}", "--new-window"])
+        return popen(
+            [
+                str(executable),
+                f"--app={url}",
+                "--new-window",
+                "--no-first-run",
+                f"--user-data-dir={profile_dir}",
+            ]
+        )
     except OSError:
         fallback(url)
         return None
+
+
+def find_edge_executable(
+    exists: Callable[[Path], bool] = Path.exists,
+    command_lookup: Callable[[str], str | None] = which,
+) -> Path | None:
+    command_path = command_lookup("msedge")
+    if command_path:
+        return Path(command_path)
+    candidates = [
+        Path(os.getenv("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+        Path(os.getenv("ProgramFiles", r"C:\Program Files")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+        Path(os.getenv("LOCALAPPDATA", "")) / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+    ]
+    for candidate in candidates:
+        if exists(candidate):
+            return candidate
+    return None
 
 
 def open_app_window_later(
@@ -55,9 +89,17 @@ def run_app_server(server: ThreadingHTTPServer) -> None:
     server.serve_forever()
 
 
-def wait_for_window_close(process: object | None, shutdown: Callable[[], object]) -> None:
+def wait_for_window_close(
+    process: object | None,
+    shutdown: Callable[[], object],
+    monotonic: Callable[[], float] = time.monotonic,
+    minimum_runtime_seconds: float = 1.0,
+) -> None:
+    started_at = monotonic()
     if process is not None and hasattr(process, "wait"):
         process.wait()
+        if monotonic() - started_at < minimum_runtime_seconds:
+            return
     shutdown()
 
 

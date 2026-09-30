@@ -94,14 +94,18 @@ class WindowsLauncherTests(TestCase):
 
         calls: list[list[str]] = []
         process = object()
+        edge_path = Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
 
         result = open_windows_app_window(
             "http://localhost:8000",
             popen=lambda args: calls.append(list(args)) or process,
             fallback=lambda _url: None,
+            edge_executable=lambda: edge_path,
         )
         self.assertIs(result, process)
-        self.assertEqual(calls, [["msedge", "--app=http://localhost:8000", "--new-window"]])
+        self.assertEqual(calls[0][0:3], [str(edge_path), "--app=http://localhost:8000", "--new-window"])
+        self.assertIn("--no-first-run", calls[0])
+        self.assertTrue(any(arg.startswith("--user-data-dir=") for arg in calls[0]))
 
     def test_open_windows_app_window_falls_back_to_browser(self) -> None:
         from src.app.windows_launcher import open_windows_app_window
@@ -113,9 +117,22 @@ class WindowsLauncherTests(TestCase):
                 "http://localhost:8000",
                 popen=lambda _args: (_ for _ in ()).throw(FileNotFoundError()),
                 fallback=opened.append,
+                edge_executable=lambda: None,
             )
         )
         self.assertEqual(opened, ["http://localhost:8000"])
+
+    def test_find_edge_executable_checks_standard_install_paths(self) -> None:
+        from src.app.windows_launcher import find_edge_executable
+
+        expected = Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
+
+        result = find_edge_executable(
+            exists=lambda path: path == expected,
+            command_lookup=lambda _name: None,
+        )
+
+        self.assertEqual(result, expected)
 
     def test_window_close_triggers_shutdown_callback(self) -> None:
         from src.app.windows_launcher import wait_for_window_close
@@ -126,6 +143,31 @@ class WindowsLauncherTests(TestCase):
             def wait(self) -> None:
                 events.append("waited")
 
-        wait_for_window_close(FakeProcess(), shutdown=lambda: events.append("shutdown"))
+        times = iter([10, 12])
+        wait_for_window_close(
+            FakeProcess(),
+            shutdown=lambda: events.append("shutdown"),
+            monotonic=lambda: next(times),
+            minimum_runtime_seconds=1,
+        )
 
         self.assertEqual(events, ["waited", "shutdown"])
+
+    def test_fast_edge_handoff_does_not_stop_server_immediately(self) -> None:
+        from src.app.windows_launcher import wait_for_window_close
+
+        events: list[str] = []
+
+        class FakeProcess:
+            def wait(self) -> None:
+                events.append("waited")
+
+        times = iter([10, 10.1])
+        wait_for_window_close(
+            FakeProcess(),
+            shutdown=lambda: events.append("shutdown"),
+            monotonic=lambda: next(times),
+            minimum_runtime_seconds=1,
+        )
+
+        self.assertEqual(events, ["waited"])
