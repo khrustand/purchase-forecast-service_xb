@@ -15,6 +15,13 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from src.app.cli import load_purchase_items
+from src.domain.menu_catalog import (
+    apply_menu_state,
+    build_menu_catalog,
+    enabled_menu_names,
+    load_menu_state,
+    toggle_menu_item,
+)
 from src.domain.planning import build_purchase_calendar, estimate_calendar_budget
 from scripts.analyze_culinary_strategy import (
     build_daily_menu,
@@ -48,6 +55,8 @@ DEFAULT_ITEMS_PATH = project_path("data/examples/purchase_items.json")
 DEFAULT_SALES_PATH = project_path("data/local/culinary_sales_june_july.xlsx")
 DEFAULT_WASTE_PATH = project_path("data/local/culinary_waste_june_july.xlsx")
 DEFAULT_SHELF_LIFE_PATH = project_path("data/local/Хранение и сроки годности, реализации.xlsx")
+DEFAULT_PREVIOUS_ORDERS_DIR = project_path("Прошлые заказы")
+DEFAULT_MENU_STATE_PATH = project_path("data/menu/menu-state.json")
 DEFAULT_ORDER_CYCLE_DAYS = 2
 REPORT_STORAGE = create_report_storage()
 WEEKDAY_LABELS = {0: "ПН", 1: "ВТ", 2: "СР", 3: "ЧТ", 4: "ПТ", 5: "СБ", 6: "ВС"}
@@ -314,7 +323,16 @@ def build_culinary_strategy_payload(
         [extract_items(read_xlsx(path), effective_start_day, scan_end_day) for path in effective_sales_paths]
     )
     actual_end_day = end_day or _latest_sales_day(scanned_items) or scan_end_day
-    items = scanned_items
+    menu_state = load_menu_state(DEFAULT_MENU_STATE_PATH)
+    menu_catalog = apply_menu_state(build_menu_catalog(DEFAULT_PREVIOUS_ORDERS_DIR), menu_state)
+    enabled_names = enabled_menu_names(menu_catalog)
+    disabled_names = set(menu_state.disabled) | {item.normalized_name for item in menu_catalog if not item.enabled}
+    items = [
+        item
+        for item in scanned_items
+        if normalize_name(item.name) not in disabled_names
+        and (not enabled_names or normalize_name(item.name) in enabled_names)
+    ]
     uploaded_waste_paths = REPORT_STORAGE.paths("waste")
     effective_waste_paths = uploaded_waste_paths or ([waste_path] if waste_path.exists() else [])
     waste_counts = _combined_waste_counts(effective_waste_paths, items, effective_start_day, actual_end_day)
@@ -332,6 +350,11 @@ def build_culinary_strategy_payload(
         "weather_updated_at": live_weather.updated_at if live_weather else None,
         "weather_stale": live_weather.stale if live_weather else False,
         "order_days": order_days,
+        "menu_catalog": {
+            "total": len(menu_catalog),
+            "enabled": sum(1 for item in menu_catalog if item.enabled),
+            "disabled": sum(1 for item in menu_catalog if not item.enabled),
+        },
         "total_quantity": sum(int(item["order_for_2_days"]) for item in daily_menu),
         "summary": daily_menu_summary(daily_menu),
         "category_totals": _category_totals(daily_menu),
@@ -365,6 +388,11 @@ def _merge_sales_items(groups: list[list[Any]]) -> list[Any]:
                 by_date[day] = by_date.get(day, 0) + quantity
             merged[key] = type(item)(item.category, item.name, by_date)
     return list(merged.values())
+
+
+def load_current_menu_catalog() -> list[Any]:
+    catalog = build_menu_catalog(DEFAULT_PREVIOUS_ORDERS_DIR)
+    return apply_menu_state(catalog, load_menu_state(DEFAULT_MENU_STATE_PATH))
 
 
 def _combined_waste_counts(
@@ -1730,7 +1758,7 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
       <div>
         <h1>Заказы кулинарии</h1>
         <div class="muted">Обеды, салаты, роллы и горячие блюда на ближайшие периоды</div>
-        <nav><a class="{'active' if view == 'orders' else ''}" href="/">Заказы</a><a class="{'active' if view == 'analytics' else ''}" href="/analytics">Аналитика</a><a href="/reports">Отчёты</a><a href="/settings">Настройки</a></nav>
+        <nav><a class="{'active' if view == 'orders' else ''}" href="/">Заказы</a><a class="{'active' if view == 'analytics' else ''}" href="/analytics">Аналитика</a><a href="/menu">Меню</a><a href="/reports">Отчёты</a><a href="/settings">Настройки</a></nav>
       </div>
       <div><a href="/reports">Ежемесячные отчеты</a><div class="muted">{payload["start_day"]} · {payload["horizon_days"]} дней</div></div>
     </header>
@@ -1836,6 +1864,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/analytics":
             self._send_html(render_dashboard_html(_payload_from_query(parsed.query), view="analytics"))
             return
+        if parsed.path == "/menu":
+            params = parse_qs(parsed.query)
+            self._send_html(render_menu_html(load_current_menu_catalog(), params.get("message", [""])[0]))
+            return
         if parsed.path == "/settings":
             self._send_html(render_settings_html())
             return
@@ -1862,6 +1894,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._redirect(f"/reports?message={_url_quote('Настройки сохранены')}")
             return
         if not self._authorize():
+            return
+        if parsed.path == "/menu/toggle":
+            fields = self._read_form_urlencoded()
+            toggle_menu_item(DEFAULT_MENU_STATE_PATH, fields.get("name", ""), fields.get("action") == "enable")
+            self._redirect(f"/menu?message={_url_quote('Меню обновлено')}")
             return
         if parsed.path != "/reports/upload":
             self._send_error_page(HTTPStatus.NOT_FOUND, "Страница не найдена")
@@ -2079,6 +2116,50 @@ def render_data_status_block(status: dict[str, Any]) -> str:
   <p class="muted">Хранилище: {escape(str(status["storage"]))}. Продажи: {sales_count}. Списания: {waste_count}.</p>
   <table><thead><tr><th>Тип</th><th>Период</th><th>Файл</th><th>Статус</th></tr></thead><tbody>{rows}</tbody></table>
 </section>"""
+
+
+def render_menu_html(items: list[Any], message: str = "") -> str:
+    rows = "".join(_render_menu_row(item) for item in items) or (
+        "<tr><td colspan='7'>Позиции меню пока не найдены. Добавьте XLSX-файлы в папку "
+        "«Прошлые заказы».</td></tr>"
+    )
+    notice = f"<p class='ok'>{escape(message)}</p>" if message else ""
+    enabled_count = sum(1 for item in items if item.enabled)
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Управление меню</title><style>
+body{{font-family:Arial,sans-serif;background:#f5f6f8;color:#17202a;margin:0}}main{{max-width:1180px;margin:30px auto;padding:0 20px}}
+section{{background:white;border-radius:14px;padding:22px;margin:18px 0;box-shadow:0 4px 18px #00000010}}table{{width:100%;border-collapse:collapse}}
+th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}}button{{font:inherit;padding:8px 10px;border:0;border-radius:8px;cursor:pointer}}
+.primary{{background:#176b55;color:white}}.secondary{{background:#eceff1;color:#17202a}}.muted{{color:#607069}}.ok{{color:#176b55}}a{{color:#176b55}}
+.disabled{{color:#7a7f86;background:#fafafa}}.number{{text-align:right;font-variant-numeric:tabular-nums}}
+</style></head><body><main><p><a href="/">← Заказы</a> · <a href="/analytics">Аналитика</a> · <a href="/reports">Отчёты</a></p>
+<h1>Управление меню</h1>{notice}
+<section><p class="muted">Источник меню: лист «Кулинария» из папки «Прошлые заказы». В расчет заказов попадают только включенные позиции.</p>
+<p><strong>{enabled_count}</strong> включено из <strong>{len(items)}</strong> позиций.</p></section>
+<section><table><thead><tr><th>Статус</th><th>Группа</th><th>Артикул</th><th>Позиция</th><th>Заказы</th><th>Среднее</th><th></th></tr></thead><tbody>{rows}</tbody></table></section>
+</main></body></html>"""
+
+
+def _render_menu_row(item: Any) -> str:
+    action = "disable" if item.enabled else "enable"
+    button_label = "Исключить из расчета" if item.enabled else "Вернуть в расчет"
+    button_class = "secondary" if item.enabled else "primary"
+    status = "в расчете" if item.enabled else "исключено"
+    row_class = "" if item.enabled else " class='disabled'"
+    return f"""<tr{row_class}>
+<td>{status}</td>
+<td>{escape(item.group)}</td>
+<td>{escape(item.sku)}</td>
+<td>{escape(item.name)}</td>
+<td class="number">{item.times_ordered}</td>
+<td class="number">{_format_number(float(item.average_order_quantity))}</td>
+<td><form method="post" action="/menu/toggle">
+<input type="hidden" name="name" value="{escape(item.normalized_name)}">
+<input type="hidden" name="action" value="{action}">
+<button class="{button_class}" type="submit">{button_label}</button>
+</form></td>
+</tr>"""
 
 
 def render_reports_html(message: str = "", error: str = "") -> str:

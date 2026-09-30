@@ -37,6 +37,8 @@ data/raw/
 data/exports/
 data/uploads/
 data/docker-volume-export/
+data/menu/
+Прошлые заказы/
 
 # Editors and OS
 .codex/

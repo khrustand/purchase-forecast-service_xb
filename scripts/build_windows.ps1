@@ -37,16 +37,29 @@ if (-not (Test-PyInstaller)) {
     & $PythonExe -m pip install pyinstaller
 }
 
-& $PythonExe -m PyInstaller `
-    --noconfirm `
-    --clean `
-    --onefile `
-    --windowed `
-    --name purchase-forecast-service `
-    --add-data "data\examples;data\examples" `
-    --collect-submodules src `
-    --collect-submodules scripts `
-    src\app\windows_launcher.py
+$pyInstallerArgs = @(
+    "--noconfirm",
+    "--clean",
+    "--onefile",
+    "--windowed",
+    "--name",
+    "purchase-forecast-service",
+    "--add-data",
+    "data\examples;data\examples",
+    "--collect-submodules",
+    "src",
+    "--collect-submodules",
+    "scripts"
+)
+
+$previousOrdersDir = "Прошлые заказы"
+if (Test-Path -LiteralPath $previousOrdersDir) {
+    $pyInstallerArgs += @("--add-data", "$previousOrdersDir;$previousOrdersDir")
+}
+
+$pyInstallerArgs += "src\app\windows_launcher.py"
+
+& $PythonExe -m PyInstaller @pyInstallerArgs
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }

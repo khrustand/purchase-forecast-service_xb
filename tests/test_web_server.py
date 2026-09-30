@@ -1,9 +1,11 @@
 from datetime import date
+from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
 
 from types import SimpleNamespace
 
+from src.app import web_server
 from src.app.web_server import _rain_sales_impact, build_dashboard_payload, render_dashboard_html, server_port
 
 
@@ -17,7 +19,8 @@ class WebServerTests(TestCase):
             self.assertEqual(server_port(), 9000)
 
     def test_builds_dashboard_payload(self) -> None:
-        payload = build_dashboard_payload(start_day=date(2026, 8, 4), horizon_days=14)
+        with patch.object(web_server, "DEFAULT_PREVIOUS_ORDERS_DIR", Path("__missing_previous_orders__")):
+            payload = build_dashboard_payload(start_day=date(2026, 8, 4), horizon_days=14)
 
         self.assertEqual(payload["start_day"], "2026-08-04")
         self.assertEqual(payload["order_cycle_days"], 2)
@@ -54,7 +57,8 @@ class WebServerTests(TestCase):
             )
 
     def test_builds_forecast_for_selected_current_date(self) -> None:
-        payload = build_dashboard_payload(start_day=date(2026, 8, 19), horizon_days=7)
+        with patch.object(web_server, "DEFAULT_PREVIOUS_ORDERS_DIR", Path("__missing_previous_orders__")):
+            payload = build_dashboard_payload(start_day=date(2026, 8, 19), horizon_days=7)
 
         current_order = payload["culinary_strategy"]["future_orders"][0]
         self.assertEqual(current_order["label"], "Ср+Чт")
@@ -65,7 +69,8 @@ class WebServerTests(TestCase):
         self.assertLess(current_order["daily_totals"][0]["traffic_factor"], 1)
 
     def test_builds_next_order_windows_from_september_sixth(self) -> None:
-        payload = build_dashboard_payload(start_day=date(2026, 9, 6), horizon_days=14)
+        with patch.object(web_server, "DEFAULT_PREVIOUS_ORDERS_DIR", Path("__missing_previous_orders__")):
+            payload = build_dashboard_payload(start_day=date(2026, 9, 6), horizon_days=14)
 
         orders = payload["culinary_strategy"]["future_orders"]
         self.assertEqual(orders[0]["start"], "2026-09-07")
@@ -87,10 +92,11 @@ class WebServerTests(TestCase):
         self.assertGreaterEqual(impact["applied_factor"], 0.70)
 
     def test_renders_dashboard_html(self) -> None:
-        html = render_dashboard_html(
-            build_dashboard_payload(start_day=date(2026, 8, 4), horizon_days=4),
-            view="analytics",
-        )
+        with patch.object(web_server, "DEFAULT_PREVIOUS_ORDERS_DIR", Path("__missing_previous_orders__")):
+            html = render_dashboard_html(
+                build_dashboard_payload(start_day=date(2026, 8, 4), horizon_days=4),
+                view="analytics",
+            )
 
         self.assertIn("Заказы кулинарии", html)
         self.assertIn("Логика прогноза", html)
@@ -105,7 +111,8 @@ class WebServerTests(TestCase):
         self.assertIn("Учет дождя", html)
 
     def test_renders_simplified_orders_workspace(self) -> None:
-        html = render_dashboard_html(build_dashboard_payload(start_day=date(2026, 9, 6), horizon_days=14))
+        with patch.object(web_server, "DEFAULT_PREVIOUS_ORDERS_DIR", Path("__missing_previous_orders__")):
+            html = render_dashboard_html(build_dashboard_payload(start_day=date(2026, 9, 6), horizon_days=14))
 
         self.assertIn("Ближайший заказ", html)
         self.assertIn("Следующие заказы", html)
