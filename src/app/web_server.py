@@ -328,11 +328,13 @@ def build_culinary_strategy_payload(
     menu_catalog = apply_menu_state(build_menu_catalog(DEFAULT_PREVIOUS_ORDERS_DIR), menu_state)
     enabled_names = enabled_menu_names(menu_catalog)
     disabled_names = set(menu_state.disabled) | {item.normalized_name for item in menu_catalog if not item.enabled}
+    own_production_names = {item.normalized_name for item in menu_catalog if item.own_production}
     menu_coverage = build_menu_coverage(scanned_items, menu_catalog)
     items = [
         item
         for item in scanned_items
         if normalize_name(item.name) not in disabled_names
+        and normalize_name(item.name) not in own_production_names
         and (not enabled_names or normalize_name(item.name) in enabled_names)
     ]
     uploaded_waste_paths = REPORT_STORAGE.paths("waste")
@@ -356,6 +358,7 @@ def build_culinary_strategy_payload(
             "total": len(menu_catalog),
             "enabled": sum(1 for item in menu_catalog if item.enabled),
             "disabled": sum(1 for item in menu_catalog if not item.enabled),
+            "own_production": sum(1 for item in menu_catalog if item.own_production),
         },
         "menu_coverage": menu_coverage,
         "total_quantity": sum(int(item["order_for_2_days"]) for item in daily_menu),
@@ -399,17 +402,22 @@ def load_current_menu_catalog() -> list[Any]:
 
 
 def build_menu_coverage(sales_items: list[Any], menu_items: list[Any]) -> dict[str, Any]:
-    enabled_names = {item.normalized_name for item in menu_items if item.enabled}
+    enabled_names = {item.normalized_name for item in menu_items if item.enabled and not item.own_production}
     disabled_names = {item.normalized_name for item in menu_items if not item.enabled}
+    own_names = {item.normalized_name for item in menu_items if item.own_production}
     buckets = {
         "in_menu": {"items": 0, "quantity": 0, "rows": []},
+        "own_production": {"items": 0, "quantity": 0, "rows": []},
         "outside_menu": {"items": 0, "quantity": 0, "rows": []},
         "disabled": {"items": 0, "quantity": 0, "rows": []},
     }
     for item in sales_items:
         normalized = normalize_name(item.name)
         quantity = sum(int(value) for value in item.by_date.values())
-        if normalized in disabled_names:
+        if normalized in own_names:
+            bucket_name = "own_production"
+            reason = "собственное производство"
+        elif normalized in disabled_names:
             bucket_name = "disabled"
             reason = "выключено в меню"
         elif enabled_names and normalized not in enabled_names:
@@ -437,6 +445,7 @@ def build_menu_coverage(sales_items: list[Any], menu_items: list[Any]) -> dict[s
         **buckets,
         "menu_enabled_items": len(enabled_names),
         "menu_disabled_items": len(disabled_names),
+        "menu_own_production_items": len(own_names),
     }
 
 
@@ -1674,6 +1683,7 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     .order-table .total-cell {{ font-weight: 800; color: var(--green); }}
     .menu-coverage {{ margin: 16px 0; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: #fbfaf7; }}
     .coverage-summary {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 10px; }}
+    .coverage-summary.four {{ grid-template-columns: repeat(4, 1fr); }}
     .coverage-summary div {{ padding: 10px; background: white; border: 1px solid var(--line); border-radius: 8px; }}
     .coverage-summary span {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }}
     .coverage-summary strong {{ font-size: 16px; }}
@@ -2441,6 +2451,93 @@ def _render_menu_row(item: Any) -> str:
 <input type="hidden" name="action" value="{action}">
 <button class="{button_class}" type="submit">{button_label}</button>
 </form></td>
+</tr>"""
+
+
+def _render_menu_coverage_block(coverage: dict[str, Any]) -> str:
+    if not coverage:
+        return ""
+    outside = coverage.get("outside_menu", {"items": 0, "quantity": 0, "rows": []})
+    disabled = coverage.get("disabled", {"items": 0, "quantity": 0, "rows": []})
+    own = coverage.get("own_production", {"items": 0, "quantity": 0, "rows": []})
+    in_menu = coverage.get("in_menu", {"items": 0, "quantity": 0, "rows": []})
+    outside_rows = _render_menu_coverage_rows(outside.get("rows", []), empty="Вне меню позиций не найдено.")
+    disabled_rows = _render_menu_coverage_rows(disabled.get("rows", []), empty="Выключенных позиций с продажами не найдено.")
+    own_rows = _render_menu_coverage_rows(own.get("rows", []), empty="Собственных позиций с продажами не найдено.")
+    return f"""
+      <div class="menu-coverage">
+        <div class="coverage-summary four">
+          <div><span>В заказе</span><strong>{in_menu.get("items", 0)} поз. / {in_menu.get("quantity", 0)} шт.</strong></div>
+          <div><span>Собственное</span><strong>{own.get("items", 0)} поз. / {own.get("quantity", 0)} шт.</strong></div>
+          <div><span>Вне меню</span><strong>{outside.get("items", 0)} поз. / {outside.get("quantity", 0)} шт.</strong></div>
+          <div><span>Исключено</span><strong>{disabled.get("items", 0)} поз. / {disabled.get("quantity", 0)} шт.</strong></div>
+        </div>
+        <details {"open" if int(own.get("items", 0)) else ""}>
+          <summary>Собственная продукция: видна, но не попадает в заказ</summary>
+          <table class="mini-table"><thead><tr><th>Позиция</th><th>Категория</th><th>Продажи</th><th>Причина</th></tr></thead><tbody>{own_rows}</tbody></table>
+        </details>
+        <details {"open" if int(outside.get("items", 0)) else ""}>
+          <summary>Позиции вне меню, которые могут объяснять расхождение</summary>
+          <table class="mini-table"><thead><tr><th>Позиция</th><th>Категория</th><th>Продажи</th><th>Причина</th></tr></thead><tbody>{outside_rows}</tbody></table>
+        </details>
+        <details>
+          <summary>Выключенные позиции с продажами</summary>
+          <table class="mini-table"><thead><tr><th>Позиция</th><th>Категория</th><th>Продажи</th><th>Причина</th></tr></thead><tbody>{disabled_rows}</tbody></table>
+        </details>
+      </div>
+    """
+
+
+def render_menu_html(items: list[Any], message: str = "", error: str = "") -> str:
+    rows = "".join(_render_menu_row(item) for item in items) or (
+        "<tr><td colspan='8'>Позиции меню пока не найдены. Загрузите XLSX-файл заказа в производство.</td></tr>"
+    )
+    notice = f"<p class='ok'>{escape(message)}</p>" if message else ""
+    failure = f"<p class='error'>{escape(error)}</p>" if error else ""
+    enabled_count = sum(1 for item in items if item.enabled and not item.own_production)
+    own_count = sum(1 for item in items if item.own_production)
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Управление меню</title><style>
+body{{font-family:Arial,sans-serif;background:#f5f6f8;color:#17202a;margin:0}}main{{max-width:1180px;margin:30px auto;padding:0 20px}}
+section{{background:white;border-radius:14px;padding:22px;margin:18px 0;box-shadow:0 4px 18px #00000010}}table{{width:100%;border-collapse:collapse}}
+th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}}button{{font:inherit;padding:8px 10px;border:0;border-radius:8px;cursor:pointer}}
+input{{font:inherit;padding:10px}}.primary{{background:#176b55;color:white}}.secondary{{background:#eceff1;color:#17202a}}.muted{{color:#607069}}.ok{{color:#176b55}}.error{{color:#b42318}}a{{color:#176b55}}
+.disabled{{color:#7a7f86;background:#fafafa}}.badge{{display:inline-block;padding:4px 7px;border-radius:999px;background:#e7efe9;color:#176b55;font-size:12px;font-weight:700}}.number{{text-align:right;font-variant-numeric:tabular-nums}}
+</style></head><body><main><p><a href="/">← Заказы</a> · <a href="/analytics">Аналитика</a> · <a href="/reports">Отчёты</a></p>
+<h1>Управление меню</h1>{notice}{failure}
+<section><h2>Добавить данные</h2><form method="post" action="/menu/upload" enctype="multipart/form-data">
+<label for="file">XLSX-файл заказа в производство</label>
+<p><input id="file" name="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required></p>
+<p><button class="primary" type="submit">Загрузить заказ</button></p>
+</form><p class="muted">Нужен файл с листом «Кулинария» и колонками «Артикул», «Товар», «К-во фасовок» или «Общее к-во».</p></section>
+<section><p class="muted">Позиции со звездочкой в исходном файле помечаются как «Собственное» и не попадают в расчет заказа.</p>
+<p><strong>{enabled_count}</strong> в заказе, <strong>{own_count}</strong> собственное, всего <strong>{len(items)}</strong> позиций.</p></section>
+<section><table><thead><tr><th>Статус</th><th>Тип</th><th>Группа</th><th>Артикул</th><th>Позиция</th><th>Заказы</th><th>Среднее</th><th></th></tr></thead><tbody>{rows}</tbody></table></section>
+</main></body></html>"""
+
+
+def _render_menu_row(item: Any) -> str:
+    action = "disable" if item.enabled else "enable"
+    button_label = "Исключить из расчета" if item.enabled else "Вернуть в расчет"
+    button_class = "secondary" if item.enabled else "primary"
+    item_type = "<span class='badge'>Собственное</span>" if item.own_production else "Поставка"
+    status = "собственное" if item.own_production else ("в расчете" if item.enabled else "исключено")
+    row_class = "" if item.enabled and not item.own_production else " class='disabled'"
+    control = "не участвует" if item.own_production else f"""<form method="post" action="/menu/toggle">
+<input type="hidden" name="name" value="{escape(item.normalized_name)}">
+<input type="hidden" name="action" value="{action}">
+<button class="{button_class}" type="submit">{button_label}</button>
+</form>"""
+    return f"""<tr{row_class}>
+<td>{status}</td>
+<td>{item_type}</td>
+<td>{escape(item.group)}</td>
+<td>{escape(item.sku)}</td>
+<td>{escape(item.name)}</td>
+<td class="number">{item.times_ordered}</td>
+<td class="number">{_format_number(float(item.average_order_quantity))}</td>
+<td>{control}</td>
 </tr>"""
 
 

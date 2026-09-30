@@ -4,22 +4,26 @@ from unittest import TestCase
 
 
 class MenuCatalogTests(TestCase):
-    def test_extracts_culinary_order_items_and_cleans_own_production_marker(self) -> None:
+    def test_extracts_culinary_order_items_and_marks_own_production(self) -> None:
         from src.domain.menu_catalog import extract_order_menu_items
 
         rows = [
-            ["№", "Артикул", "Товар", "К-во Фасовок", "Фасовка", "Общее к-во"],
+            ["№", "Артикул", "Товар", "К-во фасовок", "Фасовка", "Общее к-во"],
             ["1", "284004", "284004 Блины с курицей и сливочным сыром 0,160*", "5", "порц", "5"],
             ["2", "281016", "281016 Фо-Бо 0,300* снято", "0", "порц", "0"],
             ["3", "286004", "286004 Оливье с колбасой 0,180*", "", "порц", "6"],
+            ["4", "288009", "288009 Бефстроганов 0,300", "", "порц", "4"],
         ]
 
         items = extract_order_menu_items(rows)
 
-        self.assertEqual([item.sku for item in items], ["284004", "286004"])
+        self.assertEqual([item.sku for item in items], ["284004", "286004", "288009"])
         self.assertEqual(items[0].name, "Блины с курицей и сливочным сыром 0,160")
+        self.assertTrue(items[0].own_production)
         self.assertEqual(items[0].last_order_quantity, 5)
+        self.assertTrue(items[1].own_production)
         self.assertEqual(items[1].last_order_quantity, 6)
+        self.assertFalse(items[2].own_production)
 
     def test_overrides_exclude_item_from_enabled_menu(self) -> None:
         from src.domain.menu_catalog import MenuCatalogItem, MenuCatalogState, apply_menu_state

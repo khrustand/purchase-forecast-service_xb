@@ -25,7 +25,14 @@ class WindowsLauncherTests(TestCase):
     def test_main_sets_default_port_and_starts_server(self) -> None:
         from src.app import windows_launcher
 
-        calls: list[str] = []
+        calls: list[object] = []
+
+        class FakeServer:
+            def shutdown(self) -> None:
+                calls.append("shutdown")
+
+            def server_close(self) -> None:
+                calls.append("server_close")
 
         with patch.dict(
             os.environ,
@@ -37,28 +44,41 @@ class WindowsLauncherTests(TestCase):
             clear=True,
         ):
             with patch.object(windows_launcher, "load_runtime_env", lambda *_args: None):
-                with patch.object(windows_launcher, "open_app_window_later", lambda url: calls.append(url)):
-                    with patch.object(windows_launcher, "run_app_server", lambda: calls.append("server")):
-                        result = windows_launcher.main()
-                        self.assertEqual(os.environ["APP_PORT"], "8000")
+                with patch.object(windows_launcher, "time") as fake_time:
+                    fake_time.sleep = lambda _seconds: None
+                    with patch.object(windows_launcher, "create_app_server", lambda port: calls.append(("server", port)) or FakeServer()):
+                        with patch.object(windows_launcher, "run_app_server", lambda server: calls.append("serve")):
+                            with patch.object(windows_launcher, "open_windows_app_window", lambda url: calls.append(url) or None):
+                                result = windows_launcher.main()
+                                self.assertEqual(os.environ["APP_PORT"], "8000")
 
         self.assertEqual(result, 0)
-        self.assertEqual(calls, ["http://localhost:8000", "server"])
+        self.assertEqual(calls, [("server", 8000), "serve", "http://localhost:8000", "shutdown", "server_close"])
 
     def test_main_opens_setup_when_database_config_is_missing(self) -> None:
         from src.app import windows_launcher
 
-        calls: list[str] = []
+        calls: list[object] = []
+
+        class FakeServer:
+            def shutdown(self) -> None:
+                calls.append("shutdown")
+
+            def server_close(self) -> None:
+                calls.append("server_close")
 
         with patch.dict(os.environ, {}, clear=True):
             with patch.object(windows_launcher, "load_runtime_env", lambda *_args: None):
-                with patch.object(windows_launcher, "open_app_window_later", lambda url: calls.append(url)):
-                    with patch.object(windows_launcher, "run_app_server", lambda: calls.append("server")):
-                        result = windows_launcher.main()
-                        self.assertEqual(os.environ["APP_PORT"], "8000")
+                with patch.object(windows_launcher, "time") as fake_time:
+                    fake_time.sleep = lambda _seconds: None
+                    with patch.object(windows_launcher, "create_app_server", lambda port: calls.append(("server", port)) or FakeServer()):
+                        with patch.object(windows_launcher, "run_app_server", lambda server: calls.append("serve")):
+                            with patch.object(windows_launcher, "open_windows_app_window", lambda url: calls.append(url) or None):
+                                result = windows_launcher.main()
+                                self.assertEqual(os.environ["APP_PORT"], "8000")
 
         self.assertEqual(result, 0)
-        self.assertEqual(calls, ["http://localhost:8000/setup", "server"])
+        self.assertEqual(calls, [("server", 8000), "serve", "http://localhost:8000/setup", "shutdown", "server_close"])
 
     def test_open_app_window_later_uses_given_url(self) -> None:
         from src.app.windows_launcher import open_app_window_later
@@ -73,14 +93,14 @@ class WindowsLauncherTests(TestCase):
         from src.app.windows_launcher import open_windows_app_window
 
         calls: list[list[str]] = []
+        process = object()
 
-        self.assertTrue(
-            open_windows_app_window(
-                "http://localhost:8000",
-                popen=lambda args: calls.append(list(args)),
-                fallback=lambda _url: None,
-            )
+        result = open_windows_app_window(
+            "http://localhost:8000",
+            popen=lambda args: calls.append(list(args)) or process,
+            fallback=lambda _url: None,
         )
+        self.assertIs(result, process)
         self.assertEqual(calls, [["msedge", "--app=http://localhost:8000", "--new-window"]])
 
     def test_open_windows_app_window_falls_back_to_browser(self) -> None:
@@ -88,7 +108,7 @@ class WindowsLauncherTests(TestCase):
 
         opened: list[str] = []
 
-        self.assertFalse(
+        self.assertIsNone(
             open_windows_app_window(
                 "http://localhost:8000",
                 popen=lambda _args: (_ for _ in ()).throw(FileNotFoundError()),
@@ -96,3 +116,16 @@ class WindowsLauncherTests(TestCase):
             )
         )
         self.assertEqual(opened, ["http://localhost:8000"])
+
+    def test_window_close_triggers_shutdown_callback(self) -> None:
+        from src.app.windows_launcher import wait_for_window_close
+
+        events: list[str] = []
+
+        class FakeProcess:
+            def wait(self) -> None:
+                events.append("waited")
+
+        wait_for_window_close(FakeProcess(), shutdown=lambda: events.append("shutdown"))
+
+        self.assertEqual(events, ["waited", "shutdown"])

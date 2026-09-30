@@ -29,6 +29,7 @@ class MenuCatalogItem:
     average_order_quantity: float
     last_order_quantity: int
     enabled: bool = True
+    own_production: bool = False
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,7 @@ def extract_order_menu_items(rows: list[list[str | None]]) -> list[MenuCatalogIt
         quantity = _row_quantity(row, package_index, total_index)
         if not sku or not raw_name or quantity <= 0:
             continue
+        own_production = "*" in raw_name
         name = clean_menu_name(raw_name, sku)
         if not name or "снято" in name.lower():
             continue
@@ -67,6 +69,7 @@ def extract_order_menu_items(rows: list[list[str | None]]) -> list[MenuCatalogIt
                 times_ordered=1,
                 average_order_quantity=float(quantity),
                 last_order_quantity=int(quantity),
+                own_production=own_production,
             )
         )
     return result
@@ -88,12 +91,14 @@ def build_menu_catalog(order_dir: Path) -> list[MenuCatalogItem]:
                     "sku": item.sku,
                     "name": item.name,
                     "group": item.group,
+                    "own_production": item.own_production,
                     "quantities": [],
                 },
             )
             bucket["sku"] = item.sku
             bucket["name"] = item.name
             bucket["group"] = item.group
+            bucket["own_production"] = bool(bucket.get("own_production")) or item.own_production
             quantities = bucket["quantities"]
             assert isinstance(quantities, list)
             quantities.append(item.last_order_quantity)
@@ -112,6 +117,7 @@ def build_menu_catalog(order_dir: Path) -> list[MenuCatalogItem]:
                 times_ordered=len(quantities),
                 average_order_quantity=round(average, 1),
                 last_order_quantity=int(quantities[-1]),
+                own_production=bool(values.get("own_production")),
             )
         )
     return sorted(catalog, key=lambda item: (item.group, item.name))
@@ -122,7 +128,7 @@ def apply_menu_state(items: list[MenuCatalogItem], state: MenuCatalogState) -> l
 
 
 def enabled_menu_names(items: list[MenuCatalogItem]) -> set[str]:
-    return {item.normalized_name for item in items if item.enabled}
+    return {item.normalized_name for item in items if item.enabled and not item.own_production}
 
 
 def load_menu_state(path: Path) -> MenuCatalogState:
