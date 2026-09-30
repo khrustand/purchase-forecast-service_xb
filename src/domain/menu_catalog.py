@@ -77,7 +77,10 @@ def build_menu_catalog(order_dir: Path) -> list[MenuCatalogItem]:
     if not order_dir.exists():
         return []
     for path in sorted(order_dir.glob("*.xlsx")):
-        rows = read_culinary_order_sheet(path)
+        try:
+            rows = read_culinary_order_sheet(path)
+        except Exception:
+            continue
         for item in extract_order_menu_items(rows):
             bucket = aggregate.setdefault(
                 item.normalized_name,

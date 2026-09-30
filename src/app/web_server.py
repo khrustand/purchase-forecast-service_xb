@@ -4,6 +4,7 @@ import json
 import os
 import base64
 import hmac
+import re
 from email import policy
 from email.parser import BytesParser
 from html import escape
@@ -393,6 +394,22 @@ def _merge_sales_items(groups: list[list[Any]]) -> list[Any]:
 def load_current_menu_catalog() -> list[Any]:
     catalog = build_menu_catalog(DEFAULT_PREVIOUS_ORDERS_DIR)
     return apply_menu_state(catalog, load_menu_state(DEFAULT_MENU_STATE_PATH))
+
+
+def save_menu_order_upload(filename: str, content: bytes, target_dir: Path = DEFAULT_PREVIOUS_ORDERS_DIR) -> Path:
+    if not filename.lower().endswith(".xlsx"):
+        raise ReportValidationError("Для меню нужен XLSX-файл заказа в производство.")
+    if not content:
+        raise ReportValidationError("Файл пустой.")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-zА-Яа-яЁё0-9._ -]+", "_", Path(filename).name).strip()
+    if not safe_name:
+        safe_name = "previous-order.xlsx"
+    if not safe_name.lower().endswith(".xlsx"):
+        safe_name += ".xlsx"
+    path = target_dir / safe_name
+    path.write_bytes(content)
+    return path
 
 
 def _combined_waste_counts(
@@ -1866,7 +1883,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/menu":
             params = parse_qs(parsed.query)
-            self._send_html(render_menu_html(load_current_menu_catalog(), params.get("message", [""])[0]))
+            self._send_html(
+                render_menu_html(
+                    load_current_menu_catalog(),
+                    params.get("message", [""])[0],
+                    params.get("error", [""])[0],
+                )
+            )
             return
         if parsed.path == "/settings":
             self._send_html(render_settings_html())
@@ -1900,6 +1923,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             toggle_menu_item(DEFAULT_MENU_STATE_PATH, fields.get("name", ""), fields.get("action") == "enable")
             self._redirect(f"/menu?message={_url_quote('Меню обновлено')}")
             return
+        if parsed.path == "/menu/upload":
+            try:
+                filename, content = self._read_xlsx_upload()
+                saved = save_menu_order_upload(filename, content, DEFAULT_PREVIOUS_ORDERS_DIR)
+            except ReportValidationError as error:
+                self._redirect(f"/menu?error={_url_quote(str(error))}")
+                return
+            self._redirect(f"/menu?message={_url_quote(f'Загружен файл меню {saved.name}')}")
+            return
         if parsed.path != "/reports/upload":
             self._send_error_page(HTTPStatus.NOT_FOUND, "Страница не найдена")
             return
@@ -1920,6 +1952,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return {key: values[0] if values else "" for key, values in parsed.items()}
 
     def _read_upload(self):
+        fields = self._read_multipart_fields()
+        report_type = fields.get("report_type", (None, b""))[1].decode("utf-8", errors="replace")
+        filename, content = fields.get("file", (None, b""))
+        if not filename:
+            raise ReportValidationError("Выберите XLSX-файл.")
+        return REPORT_STORAGE.save(report_type, filename, content)
+
+    def _read_xlsx_upload(self) -> tuple[str, bytes]:
+        fields = self._read_multipart_fields()
+        filename, content = fields.get("file", (None, b""))
+        if not filename:
+            raise ReportValidationError("Выберите XLSX-файл.")
+        return filename, content
+
+    def _read_multipart_fields(self) -> dict[str, tuple[str | None, bytes]]:
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
         except ValueError as error:
@@ -1939,11 +1986,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not name:
                 continue
             fields[name] = (part.get_filename(), part.get_payload(decode=True) or b"")
-        report_type = fields.get("report_type", (None, b""))[1].decode("utf-8", errors="replace")
-        filename, content = fields.get("file", (None, b""))
-        if not filename:
-            raise ReportValidationError("Выберите XLSX-файл.")
-        return REPORT_STORAGE.save(report_type, filename, content)
+        return fields
 
     def _send_report_file(self, report_id: str) -> None:
         resolved = REPORT_STORAGE.resolve(report_id)
@@ -2258,6 +2301,55 @@ section{background:white;border:1px solid #ded8ce;border-radius:10px;padding:22p
 <dt>Расписание заказов</dt><dd>Пн+Вт, Ср+Чт, Пт+Сб+Вс</dd>
 <dt>Отсутствующие значения</dt><dd>Не считаются нулевыми продажами</dd>
 </dl><p>Изменяемые настройки будут добавлены после проверки нового рабочего экрана.</p></section></main></body></html>"""
+
+
+def render_menu_html(items: list[Any], message: str = "", error: str = "") -> str:
+    rows = "".join(_render_menu_row(item) for item in items) or (
+        "<tr><td colspan='7'>Позиции меню пока не найдены. Загрузите XLSX-файл заказа в производство.</td></tr>"
+    )
+    notice = f"<p class='ok'>{escape(message)}</p>" if message else ""
+    failure = f"<p class='error'>{escape(error)}</p>" if error else ""
+    enabled_count = sum(1 for item in items if item.enabled)
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Управление меню</title><style>
+body{{font-family:Arial,sans-serif;background:#f5f6f8;color:#17202a;margin:0}}main{{max-width:1180px;margin:30px auto;padding:0 20px}}
+section{{background:white;border-radius:14px;padding:22px;margin:18px 0;box-shadow:0 4px 18px #00000010}}table{{width:100%;border-collapse:collapse}}
+th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}}button{{font:inherit;padding:8px 10px;border:0;border-radius:8px;cursor:pointer}}
+input{{font:inherit;padding:10px}}.primary{{background:#176b55;color:white}}.secondary{{background:#eceff1;color:#17202a}}.muted{{color:#607069}}.ok{{color:#176b55}}.error{{color:#b42318}}a{{color:#176b55}}
+.disabled{{color:#7a7f86;background:#fafafa}}.number{{text-align:right;font-variant-numeric:tabular-nums}}
+</style></head><body><main><p><a href="/">← Заказы</a> · <a href="/analytics">Аналитика</a> · <a href="/reports">Отчёты</a></p>
+<h1>Управление меню</h1>{notice}{failure}
+<section><h2>Добавить данные</h2><form method="post" action="/menu/upload" enctype="multipart/form-data">
+<label for="file">XLSX-файл заказа в производство</label>
+<p><input id="file" name="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required></p>
+<p><button class="primary" type="submit">Загрузить заказ</button></p>
+</form><p class="muted">Нужен файл с листом «Кулинария» и колонками «Артикул», «Товар», «К-во фасовок» или «Общее к-во». После загрузки позиции сразу появятся ниже.</p></section>
+<section><p class="muted">Источник меню: лист «Кулинария» из загруженных прошлых заказов. В расчет заказов попадают только включенные позиции.</p>
+<p><strong>{enabled_count}</strong> включено из <strong>{len(items)}</strong> позиций.</p></section>
+<section><table><thead><tr><th>Статус</th><th>Группа</th><th>Артикул</th><th>Позиция</th><th>Заказы</th><th>Среднее</th><th></th></tr></thead><tbody>{rows}</tbody></table></section>
+</main></body></html>"""
+
+
+def _render_menu_row(item: Any) -> str:
+    action = "disable" if item.enabled else "enable"
+    button_label = "Исключить из расчета" if item.enabled else "Вернуть в расчет"
+    button_class = "secondary" if item.enabled else "primary"
+    status = "в расчете" if item.enabled else "исключено"
+    row_class = "" if item.enabled else " class='disabled'"
+    return f"""<tr{row_class}>
+<td>{status}</td>
+<td>{escape(item.group)}</td>
+<td>{escape(item.sku)}</td>
+<td>{escape(item.name)}</td>
+<td class="number">{item.times_ordered}</td>
+<td class="number">{_format_number(float(item.average_order_quantity))}</td>
+<td><form method="post" action="/menu/toggle">
+<input type="hidden" name="name" value="{escape(item.normalized_name)}">
+<input type="hidden" name="action" value="{action}">
+<button class="{button_class}" type="submit">{button_label}</button>
+</form></td>
+</tr>"""
 
 
 def _url_quote(value: str) -> str:
