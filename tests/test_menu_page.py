@@ -1,5 +1,6 @@
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
@@ -66,3 +67,27 @@ class MenuPageTests(TestCase):
         with TemporaryDirectory() as directory:
             with self.assertRaises(ReportValidationError):
                 save_menu_order_upload("Заказ.csv", b"content", Path(directory))
+
+    def test_menu_coverage_separates_menu_disabled_and_outside_items(self) -> None:
+        from src.app.web_server import build_menu_coverage
+        from src.domain.menu_catalog import MenuCatalogItem
+
+        sales_items = [
+            SimpleNamespace(category="Супы", name="Суп лапша куриный 0,300", by_date={date(2026, 8, 1): 4}),
+            SimpleNamespace(category="Салаты", name="Оливье с колбасой 0,180", by_date={date(2026, 8, 1): 3}),
+            SimpleNamespace(category="Горячее", name="Позиция вне меню", by_date={date(2026, 8, 1): 5}),
+        ]
+        menu_items = [
+            MenuCatalogItem("1", "Суп лапша куриный 0,300", "суп лапша куриный 0,300", "Супы", 2, 4, 4),
+            MenuCatalogItem("2", "Оливье с колбасой 0,180", "оливье с колбасой 0,180", "Салаты", 2, 3, 3, enabled=False),
+        ]
+
+        coverage = build_menu_coverage(sales_items, menu_items)
+
+        self.assertEqual(coverage["in_menu"]["items"], 1)
+        self.assertEqual(coverage["in_menu"]["quantity"], 4)
+        self.assertEqual(coverage["disabled"]["items"], 1)
+        self.assertEqual(coverage["disabled"]["quantity"], 3)
+        self.assertEqual(coverage["outside_menu"]["items"], 1)
+        self.assertEqual(coverage["outside_menu"]["quantity"], 5)
+        self.assertEqual(coverage["outside_menu"]["rows"][0]["name"], "Позиция вне меню")

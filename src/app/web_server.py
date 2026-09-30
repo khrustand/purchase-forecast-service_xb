@@ -328,6 +328,7 @@ def build_culinary_strategy_payload(
     menu_catalog = apply_menu_state(build_menu_catalog(DEFAULT_PREVIOUS_ORDERS_DIR), menu_state)
     enabled_names = enabled_menu_names(menu_catalog)
     disabled_names = set(menu_state.disabled) | {item.normalized_name for item in menu_catalog if not item.enabled}
+    menu_coverage = build_menu_coverage(scanned_items, menu_catalog)
     items = [
         item
         for item in scanned_items
@@ -356,6 +357,7 @@ def build_culinary_strategy_payload(
             "enabled": sum(1 for item in menu_catalog if item.enabled),
             "disabled": sum(1 for item in menu_catalog if not item.enabled),
         },
+        "menu_coverage": menu_coverage,
         "total_quantity": sum(int(item["order_for_2_days"]) for item in daily_menu),
         "summary": daily_menu_summary(daily_menu),
         "category_totals": _category_totals(daily_menu),
@@ -394,6 +396,48 @@ def _merge_sales_items(groups: list[list[Any]]) -> list[Any]:
 def load_current_menu_catalog() -> list[Any]:
     catalog = build_menu_catalog(DEFAULT_PREVIOUS_ORDERS_DIR)
     return apply_menu_state(catalog, load_menu_state(DEFAULT_MENU_STATE_PATH))
+
+
+def build_menu_coverage(sales_items: list[Any], menu_items: list[Any]) -> dict[str, Any]:
+    enabled_names = {item.normalized_name for item in menu_items if item.enabled}
+    disabled_names = {item.normalized_name for item in menu_items if not item.enabled}
+    buckets = {
+        "in_menu": {"items": 0, "quantity": 0, "rows": []},
+        "outside_menu": {"items": 0, "quantity": 0, "rows": []},
+        "disabled": {"items": 0, "quantity": 0, "rows": []},
+    }
+    for item in sales_items:
+        normalized = normalize_name(item.name)
+        quantity = sum(int(value) for value in item.by_date.values())
+        if normalized in disabled_names:
+            bucket_name = "disabled"
+            reason = "выключено в меню"
+        elif enabled_names and normalized not in enabled_names:
+            bucket_name = "outside_menu"
+            reason = "нет в текущем меню"
+        else:
+            bucket_name = "in_menu"
+            reason = "есть в меню"
+        row = {
+            "name": item.name,
+            "category": item.category,
+            "quantity": quantity,
+            "reason": reason,
+        }
+        bucket = buckets[bucket_name]
+        bucket["items"] = int(bucket["items"]) + 1
+        bucket["quantity"] = int(bucket["quantity"]) + quantity
+        bucket["rows"].append(row)
+    for bucket in buckets.values():
+        bucket["rows"] = sorted(
+            bucket["rows"],
+            key=lambda row: (-int(row["quantity"]), str(row["category"]), str(row["name"])),
+        )[:12]
+    return {
+        **buckets,
+        "menu_enabled_items": len(enabled_names),
+        "menu_disabled_items": len(disabled_names),
+    }
 
 
 def save_menu_order_upload(filename: str, content: bytes, target_dir: Path = DEFAULT_PREVIOUS_ORDERS_DIR) -> Path:
@@ -1091,6 +1135,7 @@ def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
     rain_days = sum(1 for day in current["daily_totals"] if day["rain"])
     missing_weather = sum(1 for day in current["daily_totals"] if not day["weather_available"])
     short_shelf = sum(1 for item in current["rows"] if int(item["shelf_life_days"]) < int(current["days"]))
+    menu_coverage = _render_menu_coverage_block(strategy.get("menu_coverage", {}))
     alerts = []
     if rain_days:
         alerts.append(f"Осадки повлияли на {rain_days} дн. заказа")
@@ -1110,6 +1155,7 @@ def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
       </div>
       <div class="daily-strip">{_render_daily_totals(current['daily_totals'])}</div>
       <div class="alert-row">{alert_html}</div>
+      {menu_coverage}
       <div class="table-wrap">
         <table class="order-table"><thead><tr><th>Позиция</th>{day_headings}<th>Итого</th><th>Статус</th><th></th></tr></thead><tbody>{rows}</tbody></table>
       </div>
@@ -1117,6 +1163,43 @@ def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
     <section class="next-orders"><div class="section-title"><div><span class="eyebrow">Далее</span><h2>Следующие заказы</h2></div><a href="/analytics">Открыть аналитику →</a></div><div class="next-order-grid">{next_cards}</div></section>
     <dialog id="item-dialog"><button class="dialog-close" aria-label="Закрыть">×</button><div id="dialog-content"></div></dialog>
     """
+
+
+def _render_menu_coverage_block(coverage: dict[str, Any]) -> str:
+    if not coverage:
+        return ""
+    outside = coverage.get("outside_menu", {"items": 0, "quantity": 0, "rows": []})
+    disabled = coverage.get("disabled", {"items": 0, "quantity": 0, "rows": []})
+    in_menu = coverage.get("in_menu", {"items": 0, "quantity": 0, "rows": []})
+    outside_rows = _render_menu_coverage_rows(outside.get("rows", []), empty="Вне меню позиций не найдено.")
+    disabled_rows = _render_menu_coverage_rows(disabled.get("rows", []), empty="Выключенных позиций с продажами не найдено.")
+    return f"""
+      <div class="menu-coverage">
+        <div class="coverage-summary">
+          <div><span>В меню</span><strong>{in_menu.get("items", 0)} поз. / {in_menu.get("quantity", 0)} шт.</strong></div>
+          <div><span>Вне меню</span><strong>{outside.get("items", 0)} поз. / {outside.get("quantity", 0)} шт.</strong></div>
+          <div><span>Выключено</span><strong>{disabled.get("items", 0)} поз. / {disabled.get("quantity", 0)} шт.</strong></div>
+        </div>
+        <details {"open" if int(outside.get("items", 0)) else ""}>
+          <summary>Позиции вне меню, которые могут объяснять расхождение</summary>
+          <table class="mini-table"><thead><tr><th>Позиция</th><th>Категория</th><th>Продажи</th><th>Причина</th></tr></thead><tbody>{outside_rows}</tbody></table>
+        </details>
+        <details>
+          <summary>Выключенные позиции с продажами</summary>
+          <table class="mini-table"><thead><tr><th>Позиция</th><th>Категория</th><th>Продажи</th><th>Причина</th></tr></thead><tbody>{disabled_rows}</tbody></table>
+        </details>
+      </div>
+    """
+
+
+def _render_menu_coverage_rows(rows: list[dict[str, object]], empty: str) -> str:
+    if not rows:
+        return f"<tr><td colspan='4'>{escape(empty)}</td></tr>"
+    return "".join(
+        f"<tr><td>{escape(str(row['name']))}</td><td>{escape(str(row['category']))}</td>"
+        f"<td class='number'>{row['quantity']}</td><td>{escape(str(row['reason']))}</td></tr>"
+        for row in rows
+    )
 
 
 def _render_operational_row(item: dict[str, object]) -> str:
@@ -1589,6 +1672,15 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     .order-table th span, .order-table td span {{ display: block; color: var(--muted); font-size: 11px; margin-top: 3px; }}
     .order-table .number {{ text-align: right; font-variant-numeric: tabular-nums; }}
     .order-table .total-cell {{ font-weight: 800; color: var(--green); }}
+    .menu-coverage {{ margin: 16px 0; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: #fbfaf7; }}
+    .coverage-summary {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 10px; }}
+    .coverage-summary div {{ padding: 10px; background: white; border: 1px solid var(--line); border-radius: 8px; }}
+    .coverage-summary span {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }}
+    .coverage-summary strong {{ font-size: 16px; }}
+    .menu-coverage details {{ margin-top: 10px; }}
+    .menu-coverage summary {{ cursor: pointer; font-weight: 800; color: var(--green); }}
+    .mini-table {{ margin-top: 8px; font-size: 13px; }}
+    .mini-table .number {{ text-align: right; font-variant-numeric: tabular-nums; }}
     .detail-button {{ border: 0; background: transparent; color: var(--green); cursor: pointer; font-weight: 700; padding: 6px; }}
     .next-orders {{ margin-top: 16px; }}
     .section-title {{ display: flex; justify-content: space-between; align-items: end; gap: 12px; }}

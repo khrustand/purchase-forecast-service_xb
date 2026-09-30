@@ -115,6 +115,7 @@ class WebServerTests(TestCase):
             html = render_dashboard_html(build_dashboard_payload(start_day=date(2026, 9, 6), horizon_days=14))
 
         self.assertIn("Ближайший заказ", html)
+        self.assertIn("Позиции вне меню", html)
         self.assertIn("Следующие заказы", html)
         self.assertIn("Детали позиции", html)
         self.assertIn('href="/analytics"', html)
