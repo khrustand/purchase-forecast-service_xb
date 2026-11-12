@@ -89,18 +89,23 @@ def run_app_server(server: ThreadingHTTPServer) -> None:
     server.serve_forever()
 
 
+def keep_server_alive(server_thread: threading.Thread) -> None:
+    server_thread.join()
+
+
 def wait_for_window_close(
     process: object | None,
     shutdown: Callable[[], object],
     monotonic: Callable[[], float] = time.monotonic,
     minimum_runtime_seconds: float = 1.0,
-) -> None:
+) -> bool:
     started_at = monotonic()
     if process is not None and hasattr(process, "wait"):
         process.wait()
         if monotonic() - started_at < minimum_runtime_seconds:
-            return
+            return False
     shutdown()
+    return True
 
 
 def main() -> int:
@@ -112,8 +117,11 @@ def main() -> int:
     server_thread.start()
     time.sleep(1.5)
     process = open_windows_app_window(f"http://localhost:{port}{path}")
-    wait_for_window_close(process, shutdown=server.shutdown)
-    server.server_close()
+    should_close_server = wait_for_window_close(process, shutdown=server.shutdown)
+    if should_close_server:
+        server.server_close()
+    else:
+        keep_server_alive(server_thread)
     return 0
 
 

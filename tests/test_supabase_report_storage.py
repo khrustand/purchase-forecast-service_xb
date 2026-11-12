@@ -13,6 +13,19 @@ from src.infrastructure.report_storage import (
 
 
 class ReportStorageBackendTests(TestCase):
+    def test_cached_file_is_not_used_after_report_row_is_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report_id = 'a' * 32
+            cached = Path(directory) / f'sales-{report_id}.xlsx'
+            cached.write_bytes(b'cached workbook')
+            storage = SupabaseReportStorage(
+                url='https://example.supabase.co', service_role_key='secret',
+                cache_root=Path(directory), request=lambda *args: (200, b'[]'),
+            )
+            self.assertEqual(storage.list(), [])
+            self.assertIsNone(storage.resolve(report_id))
+            self.assertEqual(storage.paths('sales'), [])
+
     def test_storage_factory_uses_local_backend_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with patch.dict("os.environ", {"REPORT_UPLOAD_DIR": directory}, clear=True):

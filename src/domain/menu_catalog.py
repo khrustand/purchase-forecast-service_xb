@@ -35,6 +35,7 @@ class MenuCatalogItem:
 @dataclass(frozen=True)
 class MenuCatalogState:
     disabled: set[str]
+    own_production: set[str] | None = None
 
 
 def extract_order_menu_items(rows: list[list[str | None]]) -> list[MenuCatalogItem]:
@@ -56,7 +57,6 @@ def extract_order_menu_items(rows: list[list[str | None]]) -> list[MenuCatalogIt
         quantity = _row_quantity(row, package_index, total_index)
         if not sku or not raw_name or quantity <= 0:
             continue
-        own_production = "*" in raw_name
         name = clean_menu_name(raw_name, sku)
         if not name or "снято" in name.lower():
             continue
@@ -69,7 +69,6 @@ def extract_order_menu_items(rows: list[list[str | None]]) -> list[MenuCatalogIt
                 times_ordered=1,
                 average_order_quantity=float(quantity),
                 last_order_quantity=int(quantity),
-                own_production=own_production,
             )
         )
     return result
@@ -91,14 +90,12 @@ def build_menu_catalog(order_dir: Path) -> list[MenuCatalogItem]:
                     "sku": item.sku,
                     "name": item.name,
                     "group": item.group,
-                    "own_production": item.own_production,
                     "quantities": [],
                 },
             )
             bucket["sku"] = item.sku
             bucket["name"] = item.name
             bucket["group"] = item.group
-            bucket["own_production"] = bool(bucket.get("own_production")) or item.own_production
             quantities = bucket["quantities"]
             assert isinstance(quantities, list)
             quantities.append(item.last_order_quantity)
@@ -117,32 +114,50 @@ def build_menu_catalog(order_dir: Path) -> list[MenuCatalogItem]:
                 times_ordered=len(quantities),
                 average_order_quantity=round(average, 1),
                 last_order_quantity=int(quantities[-1]),
-                own_production=bool(values.get("own_production")),
             )
         )
     return sorted(catalog, key=lambda item: (item.group, item.name))
 
 
 def apply_menu_state(items: list[MenuCatalogItem], state: MenuCatalogState) -> list[MenuCatalogItem]:
-    return [replace(item, enabled=item.normalized_name not in state.disabled) for item in items]
+    own_production = state.own_production or set()
+    return [
+        replace(
+            item,
+            enabled=item.normalized_name not in state.disabled,
+            own_production=item.normalized_name in own_production,
+        )
+        for item in items
+    ]
 
 
 def enabled_menu_names(items: list[MenuCatalogItem]) -> set[str]:
-    return {item.normalized_name for item in items if item.enabled and not item.own_production}
+    return {item.normalized_name for item in items if item.enabled}
 
 
 def load_menu_state(path: Path) -> MenuCatalogState:
     if not path.exists():
-        return MenuCatalogState(disabled=set())
+        return MenuCatalogState(disabled=set(), own_production=set())
     payload = json.loads(path.read_text(encoding="utf-8"))
     disabled = payload.get("disabled", [])
-    return MenuCatalogState(disabled={str(value) for value in disabled})
+    own_production = payload.get("own_production", [])
+    return MenuCatalogState(
+        disabled={str(value) for value in disabled},
+        own_production={str(value) for value in own_production},
+    )
 
 
 def save_menu_state(path: Path, state: MenuCatalogState) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps({"disabled": sorted(state.disabled)}, ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                "disabled": sorted(state.disabled),
+                "own_production": sorted(state.own_production or set()),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
@@ -154,7 +169,19 @@ def toggle_menu_item(path: Path, normalized_name: str, enabled: bool) -> MenuCat
         disabled.discard(normalized_name)
     else:
         disabled.add(normalized_name)
-    updated = MenuCatalogState(disabled=disabled)
+    updated = MenuCatalogState(disabled=disabled, own_production=set(state.own_production or set()))
+    save_menu_state(path, updated)
+    return updated
+
+
+def toggle_menu_supply_type(path: Path, normalized_name: str, own_production: bool) -> MenuCatalogState:
+    state = load_menu_state(path)
+    own_names = set(state.own_production or set())
+    if own_production:
+        own_names.add(normalized_name)
+    else:
+        own_names.discard(normalized_name)
+    updated = MenuCatalogState(disabled=set(state.disabled), own_production=own_names)
     save_menu_state(path, updated)
     return updated
 

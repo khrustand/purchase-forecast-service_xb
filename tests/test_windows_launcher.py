@@ -171,3 +171,43 @@ class WindowsLauncherTests(TestCase):
         )
 
         self.assertEqual(events, ["waited"])
+
+    def test_main_keeps_server_open_when_edge_hands_off_immediately(self) -> None:
+        from src.app import windows_launcher
+
+        calls: list[object] = []
+
+        class FakeServer:
+            def shutdown(self) -> None:
+                calls.append("shutdown")
+
+            def server_close(self) -> None:
+                calls.append("server_close")
+
+        class FastExitProcess:
+            def wait(self) -> None:
+                calls.append("waited")
+
+        times = iter([10, 10.1])
+
+        with patch.dict(
+            os.environ,
+            {
+                "STORAGE_BACKEND": "supabase",
+                "SUPABASE_URL": "https://example.supabase.co",
+                "SUPABASE_SERVICE_ROLE_KEY": "sb_secret_test",
+            },
+            clear=True,
+        ):
+            with patch.object(windows_launcher, "load_runtime_env", lambda *_args: None):
+                with patch.object(windows_launcher, "time") as fake_time:
+                    fake_time.sleep = lambda _seconds: None
+                    fake_time.monotonic = lambda: next(times)
+                    with patch.object(windows_launcher, "create_app_server", lambda port: calls.append(("server", port)) or FakeServer()):
+                        with patch.object(windows_launcher, "run_app_server", lambda _server: calls.append("serve")):
+                            with patch.object(windows_launcher, "open_windows_app_window", lambda _url: FastExitProcess()):
+                                with patch.object(windows_launcher, "keep_server_alive", lambda _thread: calls.append("join")):
+                                    result = windows_launcher.main()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [("server", 8000), "serve", "waited", "join"])

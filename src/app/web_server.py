@@ -5,6 +5,7 @@ import os
 import base64
 import hmac
 import re
+from dataclasses import replace
 from email import policy
 from email.parser import BytesParser
 from html import escape
@@ -22,8 +23,11 @@ from src.domain.menu_catalog import (
     enabled_menu_names,
     load_menu_state,
     toggle_menu_item,
+    toggle_menu_supply_type,
 )
 from src.domain.planning import build_purchase_calendar, estimate_calendar_budget
+from src.domain.production import daily_production_plan
+from src.domain.culinary import is_culinary_category
 from scripts.analyze_culinary_strategy import (
     build_daily_menu,
     build_recommendations,
@@ -41,6 +45,7 @@ from src.infrastructure.report_storage import (
     MAX_UPLOAD_BYTES,
     ReportValidationError,
     create_report_storage,
+    validate_report_content,
 )
 from src.infrastructure.app_config import (
     AppConfigError,
@@ -59,6 +64,9 @@ DEFAULT_SHELF_LIFE_PATH = project_path("data/local/Хранение и срок�
 DEFAULT_PREVIOUS_ORDERS_DIR = project_path("Прошлые заказы")
 DEFAULT_MENU_STATE_PATH = project_path("data/menu/menu-state.json")
 DEFAULT_ORDER_CYCLE_DAYS = 2
+MAX_BATCH_FILES = 100
+MAX_BATCH_UPLOAD_MB = 250
+MAX_BATCH_UPLOAD_BYTES = MAX_BATCH_UPLOAD_MB * 1024 * 1024
 REPORT_STORAGE = create_report_storage()
 WEEKDAY_LABELS = {0: "ПН", 1: "ВТ", 2: "СР", 3: "ЧТ", 4: "ПТ", 5: "СБ", 6: "ВС"}
 
@@ -281,7 +289,7 @@ def build_dashboard_payload(
         ],
         "demand_factors": {
             "status": "демо-логика",
-            "summary": "Погода и день недели пока не подключены к расчету автоматически.",
+            "summary": "В рабочем прогнозе учитываются погода и история продаж по дням недели. Статус источника и коэффициенты показаны в расчете.",
             "effect": "Холод и дождь могут поднимать спрос на супы и горячие обеды; жара чаще смещает спрос в салаты и роллы. После твоих выгрузок эти коэффициенты лучше считать по факту продаж.",
         },
         "next_data": [
@@ -305,10 +313,15 @@ def build_culinary_strategy_payload(
     reference_day: date | None = None,
 ) -> dict[str, Any] | None:
     live_weather = load_met_norway_forecast()
+    # Не оставляем предыдущий сетевой прогноз активным после отключения провайдера.
+    for day in list(WEATHER_BY_DATE):
+        if WEATHER_BY_DATE[day].get('source') == 'MET Norway':
+            del WEATHER_BY_DATE[day]
     if live_weather is not None:
         WEATHER_BY_DATE.update(live_weather.days)
     uploaded_sales_paths = REPORT_STORAGE.paths("sales")
-    effective_sales_paths = uploaded_sales_paths or ([sales_path] if sales_path.exists() else [])
+    allow_local_fallback = REPORT_STORAGE.storage_label() != 'Supabase'
+    effective_sales_paths = uploaded_sales_paths or ([sales_path] if allow_local_fallback and sales_path.exists() else [])
     if not effective_sales_paths:
         return None
 
@@ -334,20 +347,45 @@ def build_culinary_strategy_payload(
         item
         for item in scanned_items
         if normalize_name(item.name) not in disabled_names
-        and normalize_name(item.name) not in own_production_names
         and (not enabled_names or normalize_name(item.name) in enabled_names)
     ]
+    items = align_sales_with_menu(items, menu_catalog)
     uploaded_waste_paths = REPORT_STORAGE.paths("waste")
-    effective_waste_paths = uploaded_waste_paths or ([waste_path] if waste_path.exists() else [])
+    effective_waste_paths = uploaded_waste_paths or ([waste_path] if allow_local_fallback and waste_path.exists() else [])
     waste_counts = _combined_waste_counts(effective_waste_paths, items, effective_start_day, actual_end_day)
     waste_by_date = _combined_waste_by_date(effective_waste_paths, items, effective_start_day, actual_end_day)
     shelf_life = extract_shelf_life(shelf_life_path, items) if shelf_life_path.exists() else {}
     recommendations = build_recommendations(items, order_days, waste_counts, shelf_life)
-    daily_menu = _with_decision_explanations(build_daily_menu(recommendations))
+    daily_menu = _with_supply_types(
+        _with_decision_explanations(build_daily_menu(recommendations)),
+        own_production_names,
+    )
     forecast_reference_day = reference_day or date.today() - timedelta(days=1)
     rain_impact = _rain_sales_impact(items, effective_start_day, actual_end_day)
 
+    production_start = forecast_reference_day + timedelta(days=1)
+    production_items = [
+        {'key': item.normalized_name, 'name': item.name, 'category': item.group}
+        for item in menu_catalog if item.enabled and item.own_production
+    ]
+    production_history: dict[str, dict[date, float]] = {}
+    for item in scanned_items:
+        values = production_history.setdefault(normalize_name(item.name), {})
+        for day, quantity in item.by_date.items():
+            values[day] = values.get(day, 0) + quantity
+    production_factors = {
+        (item['key'], production_start + timedelta(days=offset)):
+        _weather_factor(item['category'], [production_start + timedelta(days=offset)], float(rain_impact['applied_factor']))
+        for item in production_items for offset in range(7)
+    }
+    production = daily_production_plan(production_items, production_start, 7, production_history, production_factors)
+    for entry in production:
+        day = date.fromisoformat(entry['date'])
+        entry['weather'] = str(WEATHER_BY_DATE.get(day, {}).get('summary', 'нет прогноза; погодная поправка не применяется'))
+
     return {
+        'production_days': production,
+        'unavailable_reports': list(getattr(REPORT_STORAGE, 'unavailable_reports', {}).values()),
         "period": f"{effective_start_day.isoformat()}..{actual_end_day.isoformat()}",
         "weather_city": "Санкт-Петербург",
         "weather_source": live_weather.source if live_weather else "встроенные данные",
@@ -380,6 +418,20 @@ def build_culinary_strategy_payload(
     }
 
 
+def align_sales_with_menu(items: list[Any], menu_catalog: list[Any]) -> list[Any]:
+    """Использовать рабочие группы меню, сохраняя исходные файлы отчетов."""
+    catalog = {item.normalized_name: item for item in menu_catalog}
+    groups = {'Супы', 'Горячее', 'Салаты', 'Завтраки', 'Роллы'}
+    aligned = []
+    for item in items:
+        menu_item = catalog.get(normalize_name(item.name))
+        if menu_item is not None:
+            item = replace(item, name=menu_item.name,
+                           category=menu_item.group if menu_item.group in groups else item.category)
+        aligned.append(item)
+    return _merge_sales_items([aligned])
+
+
 def _merge_sales_items(groups: list[list[Any]]) -> list[Any]:
     merged: dict[tuple[str, str], Any] = {}
     for items in groups:
@@ -402,7 +454,8 @@ def load_current_menu_catalog() -> list[Any]:
 
 
 def build_menu_coverage(sales_items: list[Any], menu_items: list[Any]) -> dict[str, Any]:
-    enabled_names = {item.normalized_name for item in menu_items if item.enabled and not item.own_production}
+    menu_names = {item.normalized_name for item in menu_items}
+    enabled_names = {item.normalized_name for item in menu_items if item.enabled}
     disabled_names = {item.normalized_name for item in menu_items if not item.enabled}
     own_names = {item.normalized_name for item in menu_items if item.own_production}
     buckets = {
@@ -413,6 +466,8 @@ def build_menu_coverage(sales_items: list[Any], menu_items: list[Any]) -> dict[s
     }
     for item in sales_items:
         normalized = normalize_name(item.name)
+        if normalized not in menu_names and not is_culinary_category(item.category):
+            continue
         quantity = sum(int(value) for value in item.by_date.values())
         if normalized in own_names:
             bucket_name = "own_production"
@@ -420,7 +475,7 @@ def build_menu_coverage(sales_items: list[Any], menu_items: list[Any]) -> dict[s
         elif normalized in disabled_names:
             bucket_name = "disabled"
             reason = "выключено в меню"
-        elif enabled_names and normalized not in enabled_names:
+        elif normalized not in menu_names:
             bucket_name = "outside_menu"
             reason = "нет в текущем меню"
         else:
@@ -447,6 +502,20 @@ def build_menu_coverage(sales_items: list[Any], menu_items: list[Any]) -> dict[s
         "menu_disabled_items": len(disabled_names),
         "menu_own_production_items": len(own_names),
     }
+
+
+def _with_supply_types(items: list[dict[str, object]], own_production_names: set[str]) -> list[dict[str, object]]:
+    result = []
+    for item in items:
+        supply_type = "own_production" if normalize_name(str(item["name"])) in own_production_names else "supplier"
+        result.append(
+            {
+                **item,
+                "supply_type": supply_type,
+                "supply_label": "Собственное производство" if supply_type == "own_production" else "Поставка",
+            }
+        )
+    return result
 
 
 def save_menu_order_upload(filename: str, content: bytes, target_dir: Path = DEFAULT_PREVIOUS_ORDERS_DIR) -> Path:
@@ -735,6 +804,12 @@ def _future_period(
         "weather": _weather_summary(period_days),
         "rain_traffic_factor": round(rain_traffic_factor, 2),
         "total_quantity": sum(int(item["forecast_quantity"]) for item in rows),
+        "supplier_quantity": sum(
+            int(item["forecast_quantity"]) for item in rows if item.get("supply_type") != "own_production"
+        ),
+        "production_quantity": sum(
+            int(item["forecast_quantity"]) for item in rows if item.get("supply_type") == "own_production"
+        ),
         "daily_totals": daily_totals,
         "rows": sorted(rows, key=lambda item: (str(item["category"]), str(item["name"]))),
     }
@@ -1090,8 +1165,6 @@ def _weather_factor(
             factor += 0.08
         if temperature >= 27 and category in {"Супы", "Горячее"}:
             factor -= 0.03
-        if day.weekday() >= 5 and category == "Завтраки":
-            factor += 0.05
         factors.append(max(0.70, factor))
     return sum(factors) / len(factors) if factors else 1.0
 
@@ -1522,6 +1595,248 @@ def _risk_class(value: str) -> str:
     return "risk low"
 
 
+def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
+    if strategy is None:
+        return "<section class='workspace'><h2>Ближайший заказ</h2><div class='signal-box'>Загрузите отчет продаж, чтобы построить прогноз.</div></section>"
+
+    current = strategy["future_orders"][0]
+    following = strategy["future_orders"][1:]
+    day_headings = "".join(
+        f"<th>{escape(str(day['weekday']))}<span>{escape(str(day['date']))}</span></th>"
+        for day in current["daily_totals"]
+    )
+    rows = "".join(_render_operational_row(item) for item in current["rows"])
+    next_cards = "".join(
+        f"<a class='next-order-card' href='/?start={period['start']}&days=14'>"
+        f"<span>{escape(str(period['label']))} · {escape(str(period['start']))}—{escape(str(period['end']))}</span>"
+        f"<strong>{period['total_quantity']} шт.</strong>"
+        f"<small>Поставка: {period.get('supplier_quantity', period['total_quantity'])} · Собственное: {period.get('production_quantity', 0)}</small>"
+        f"<small>{escape(str(period['weather']))}</small></a>"
+        for period in following
+    )
+    rain_days = sum(1 for day in current["daily_totals"] if day["rain"])
+    missing_weather = sum(1 for day in current["daily_totals"] if not day["weather_available"])
+    short_shelf = sum(1 for item in current["rows"] if int(item["shelf_life_days"]) < int(current["days"]))
+    menu_coverage = _render_menu_coverage_block(strategy.get("menu_coverage", {}))
+    alerts = []
+    if rain_days:
+        alerts.append(f"Осадки повлияли на {rain_days} дн. заказа")
+    if missing_weather:
+        alerts.append(f"Нет прогноза погоды на {missing_weather} дн.")
+    if short_shelf:
+        alerts.append(f"{short_shelf} поз. требуют дополнительной поставки")
+    alert_html = "".join(f"<span class='alert-chip'>{escape(alert)}</span>" for alert in alerts) or "<span class='ok-chip'>Критичных предупреждений нет</span>"
+    updated = strategy["weather_updated_at"] or "нет данных"
+
+    return f"""
+    <section class="workspace order-focus">
+      <div class="workspace-head">
+        <div><span class="eyebrow">Ближайший заказ</span><h2>{current['label']} · {current['start']}—{current['end']}</h2>
+        <div class="muted">Продажи учтены по {strategy['period'].split('..')[-1]} · погода: {escape(str(strategy['weather_source']))}, {escape(str(updated))}</div></div>
+        <div class="order-totals">
+          <div class="order-total"><span>Всего план</span><strong>{current['total_quantity']}</strong><small>штук</small></div>
+          <div class="order-total supplier"><span>Заказать</span><strong>{current.get('supplier_quantity', current['total_quantity'])}</strong><small>поставка</small></div>
+          <div class="order-total production"><span>Произвести</span><strong>{current.get('production_quantity', 0)}</strong><small>собственное</small></div>
+        </div>
+      </div>
+      <div class="daily-strip">{_render_daily_totals(current['daily_totals'])}</div>
+      <div class="alert-row">{alert_html}</div>
+      {menu_coverage}
+      <div class="table-wrap">
+        <table class="order-table"><thead><tr><th>Позиция</th><th>Тип</th>{day_headings}<th>Итого</th><th>Статус</th><th></th></tr></thead><tbody>{rows}</tbody></table>
+      </div>
+    </section>
+    <section class="next-orders"><div class="section-title"><div><span class="eyebrow">Далее</span><h2>Следующие заказы</h2></div><a href="/analytics">Открыть аналитику →</a></div><div class="next-order-grid">{next_cards}</div></section>
+    <dialog id="item-dialog"><button class="dialog-close" aria-label="Закрыть">×</button><div id="dialog-content"></div></dialog>
+    """
+
+
+def _render_operational_row(item: dict[str, object]) -> str:
+    day_cells = "".join(f"<td class='number'>{day['quantity']}</td>" for day in item["daily_forecast"])
+    status = str(item.get("waste_risk", "контроль"))
+    supply_type = str(item.get("supply_type", "supplier"))
+    supply_label = "Собственное" if supply_type == "own_production" else "Поставка"
+    supply_class = "production" if supply_type == "own_production" else "supplier"
+    details = (
+        f"Тип: {item.get('supply_label', supply_label)}\n"
+        f"Категория: {item['category']}\n"
+        f"Срок хранения: {item['shelf_life_days']} дн.\n"
+        f"Продажи прошлого окна: {item['previous_period_sales'] if item['previous_period_sales'] is not None else 'нет данных'}\n"
+        f"Списания прошлого окна: {item['previous_period_waste']}\n"
+        f"Погодный коэффициент: x{item['weather_factor']}\n"
+        f"Решение: {item.get('decision_reason', item.get('strategy', 'нет данных'))}\n"
+        f"Риск: {_future_risk_context(item)}"
+    )
+    return (
+        f"<tr class='{supply_class}'><td><strong>{escape(str(item['name']))}</strong><span>{escape(str(item['category']))}</span></td>"
+        f"<td><span class='type-chip {supply_class}'>{escape(supply_label)}</span></td>"
+        f"{day_cells}<td class='number total-cell'>{item['forecast_quantity']}</td>"
+        f"<td><i class='{_risk_class(status)}'>{escape(status)}</i></td>"
+        f"<td><button class='detail-button' data-name='{escape(str(item['name']), quote=True)}' data-details='{escape(details, quote=True)}'>Подробнее</button></td></tr>"
+    )
+
+
+def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
+    if strategy is None:
+        return "<section class='workspace'><h2>Ближайший заказ</h2><div class='signal-box'>Загрузите отчет продаж, чтобы построить прогноз.</div></section>"
+
+    current = strategy["future_orders"][0]
+    following = strategy["future_orders"][1:]
+    day_headings = "".join(
+        f"<th>{escape(str(day['weekday']))}<span>{escape(str(day['date']))}</span></th>"
+        for day in current["daily_totals"]
+    )
+    rows = "".join(_render_operational_row(item) for item in current["rows"])
+    next_cards = "".join(
+        f"<a class='next-order-card' href='/?start={period['start']}&days=14'>"
+        f"<span>{escape(str(period['label']))} · {escape(str(period['start']))}—{escape(str(period['end']))}</span>"
+        f"<strong>{period['total_quantity']} шт.</strong>"
+        f"<small>Поставка: {period.get('supplier_quantity', period['total_quantity'])} · Собственное: {period.get('production_quantity', 0)}</small>"
+        f"<small>{escape(str(period['weather']))}</small></a>"
+        for period in following
+    )
+    rain_days = sum(1 for day in current["daily_totals"] if day["rain"])
+    missing_weather = sum(1 for day in current["daily_totals"] if not day["weather_available"])
+    short_shelf = sum(1 for item in current["rows"] if int(item["shelf_life_days"]) < int(current["days"]))
+    menu_coverage = _render_menu_coverage_block(strategy.get("menu_coverage", {}))
+    alerts = []
+    if rain_days:
+        alerts.append(f"Осадки повлияли на {rain_days} дн. заказа")
+    if missing_weather:
+        alerts.append(f"Нет прогноза погоды на {missing_weather} дн.")
+    if short_shelf:
+        alerts.append(f"{short_shelf} поз. требуют дополнительной поставки")
+    alert_html = "".join(f"<span class='alert-chip'>{escape(alert)}</span>" for alert in alerts) or "<span class='ok-chip'>Критичных предупреждений нет</span>"
+    updated = strategy["weather_updated_at"] or "нет данных"
+
+    return f"""
+    <section class="workspace order-focus">
+      <div class="workspace-head">
+        <div><span class="eyebrow">Ближайший заказ</span><h2>{current['label']} · {current['start']}—{current['end']}</h2>
+        <div class="muted">Продажи учтены по {strategy['period'].split('..')[-1]} · погода: {escape(str(strategy['weather_source']))}, {escape(str(updated))}</div></div>
+        <div class="order-totals">
+          <div class="order-total"><span>Всего план</span><strong>{current['total_quantity']}</strong><small>штук</small></div>
+          <div class="order-total supplier"><span>Заказать</span><strong>{current.get('supplier_quantity', current['total_quantity'])}</strong><small>поставка</small></div>
+          <div class="order-total production"><span>Произвести</span><strong>{current.get('production_quantity', 0)}</strong><small>собственное</small></div>
+        </div>
+      </div>
+      <div class="daily-strip">{_render_daily_totals(current['daily_totals'])}</div>
+      <div class="alert-row">{alert_html}</div>
+      {_render_order_calculation_block(strategy, current)}
+      {menu_coverage}
+      <div class="table-wrap">
+        <table class="order-table"><thead><tr><th>Позиция</th><th>Тип</th>{day_headings}<th>Итого</th><th>Статус</th><th></th></tr></thead><tbody>{rows}</tbody></table>
+      </div>
+    </section>
+    <section class="next-orders"><div class="section-title"><div><span class="eyebrow">Далее</span><h2>Следующие заказы</h2></div><a href="/analytics">Открыть аналитику →</a></div><div class="next-order-grid">{next_cards}</div></section>
+    <dialog id="item-dialog"><button class="dialog-close" aria-label="Закрыть">×</button><div id="dialog-content"></div></dialog>
+    """
+
+
+def _render_order_calculation_block(strategy: dict[str, Any], current: dict[str, Any]) -> str:
+    return f"""
+      <section class="calculation-box">
+        <h3>Как рассчитан заказ</h3>
+        <ol>
+          <li><strong>Период:</strong> {escape(str(current['label']))}, {escape(str(current['start']))}—{escape(str(current['end']))}; окно {current['days']} дн.</li>
+          <li><strong>База:</strong> продажи из отчетов за {escape(str(strategy['period']))}; нулевые отсутствующие дни не подставляются.</li>
+          <li><strong>Меню:</strong> в расчет попадают включенные позиции меню; отключенные позиции исключаются вручную.</li>
+          <li><strong>Тип:</strong> поставка и собственное производство задаются вручную в разделе «Меню».</li>
+          <li><strong>Корректировки:</strong> срок годности ограничивает запас, списания уменьшают страховой запас, погода применяется только когда есть прогноз.</li>
+          <li><strong>Итог:</strong> прогноз по дням суммируется в общее количество к заказу.</li>
+        </ol>
+      </section>
+    """
+
+
+def _render_operational_row(item: dict[str, object]) -> str:
+    day_cells = "".join(f"<td class='number'>{day['quantity']}</td>" for day in item["daily_forecast"])
+    status = str(item.get("waste_risk", "контроль"))
+    supply_type = str(item.get("supply_type", "supplier"))
+    supply_label = "Собственное" if supply_type == "own_production" else "Поставка"
+    supply_class = "production" if supply_type == "own_production" else "supplier"
+    details_html = _render_item_details(item, supply_label)
+    return (
+        f"<tr class='{supply_class}'><td><strong>{escape(str(item['name']))}</strong><span>{escape(str(item['category']))}</span></td>"
+        f"<td><span class='type-chip {supply_class}'>{escape(supply_label)}</span></td>"
+        f"{day_cells}<td class='number total-cell'>{item['forecast_quantity']}</td>"
+        f"<td><i class='{_risk_class(status)}'>{escape(status)}</i></td>"
+        f"<td><button class='detail-button' data-name='{escape(str(item['name']), quote=True)}'>Подробнее</button><template>{details_html}</template></td></tr>"
+    )
+
+
+def _render_item_details(item: dict[str, object], supply_label: str) -> str:
+    previous_sales = item["previous_period_sales"] if item["previous_period_sales"] is not None else "нет данных"
+    daily_rows = "".join(
+        f"<li>{escape(str(day['weekday']))} {escape(str(day['date']))}: <strong>{day['quantity']} шт.</strong>, коэффициент погоды x{day.get('weather_factor', item.get('weather_factor', 1))}</li>"
+        for day in item["daily_forecast"]
+    )
+    return f"""
+      <div class="detail-panel">
+        <span class="eyebrow">Детали позиции</span>
+        <h2>{escape(str(item['name']))}</h2>
+        <dl>
+          <dt>Тип</dt><dd>{escape(supply_label)}</dd>
+          <dt>Категория</dt><dd>{escape(str(item['category']))}</dd>
+          <dt>Итог к заказу</dt><dd>{item['forecast_quantity']} шт.</dd>
+          <dt>Продажи за весь период</dt><dd>{item.get('sales_june_july', 0)} шт.</dd>
+          <dt>Средний спрос</dt><dd>{item.get('average_per_day', 0)} шт./день</dd>
+          <dt>Продажи прошлого окна</dt><dd>{previous_sales}</dd>
+          <dt>Списания прошлого окна</dt><dd>{item['previous_period_waste']}</dd>
+          <dt>Срок хранения</dt><dd>{item['shelf_life_days']} дн.</dd>
+          <dt>Погодный коэффициент</dt><dd>x{item['weather_factor']}</dd>
+          <dt>Решение</dt><dd>{escape(str(item.get('decision_reason', item.get('strategy', 'нет данных'))))}</dd>
+          <dt>Риск</dt><dd>{escape(_future_risk_context(item))}</dd>
+        </dl>
+        <h3>Разбивка по дням</h3>
+        <ul>{daily_rows}</ul>
+      </div>
+    """
+
+
+def render_production_workspace(strategy: dict[str, Any] | None) -> str:
+    if not strategy:
+        return '<section><h2>Кулинария ТТ</h2><p>Загрузите продажи и отметьте собственные позиции в <a href="/menu">управлении меню</a>.</p></section>'
+    days = strategy.get('production_days', [])
+    if not days or not days[0]['rows']:
+        return '<section><h2>Кулинария ТТ</h2><p>Нет включенных собственных позиций. Выберите тип «Собственное» в <a href="/menu">управлении меню</a>.</p></section>'
+    headings = ''.join(f"<th>{day['date']}<br>{WEEKDAY_LABELS[date.fromisoformat(day['date']).weekday()]}</th>" for day in days)
+    rows = []
+    for index, item in enumerate(days[0]['rows']):
+        cells = []
+        for day in days:
+            row = day['rows'][index]
+            quantity = row['quantity'] if row['quantity'] is not None else 'нет данных'
+            base = 'нет данных' if row['base_quantity'] is None else f"{row['base_quantity']:.2f}"
+            cells.append(f"<td><strong>{quantity}</strong><br><small>база {base} × {row['weather_factor']}<br>{escape(row['basis'])}, наблюдений: {row['history_points']}</small></td>")
+        rows.append(f"<tr><td><strong>{escape(item['name'])}</strong><br>{escape(item['category'])}</td>{''.join(cells)}</tr>")
+    totals = ''.join(f"<td><strong>{day['total']}</strong><br><small>без истории: {day['missing_history']}</small></td>" for day in days)
+    weather = ''.join(f"<td><small>{escape(day['weather'])}</small></td>" for day in days)
+    return f'''<section class="workspace"><h2>Кулинария ТТ</h2>
+    <form method="get" action="/production"><label>Начало плана <input type="date" name="start" value="{days[0]['date']}" required></label> <button type="submit">Рассчитать неделю</button></form>
+    <p>Ежедневный план на 7 дней. Только включенные позиции с типом «Собственное» из <a href="/menu">управления меню</a>, без квот поставщика.</p>
+    <p class="muted">База — средние продажи того же дня недели; если их нет, среднее по доступной истории до начала плана. Отсутствующие дни не считаются нулевыми. База × погода, округление до целого. Остатки, списания и размер партии здесь не вычитаются: перед приготовлением проверьте остаток. План не накапливает запас на несколько дней.</p>
+    <div class="table-wrap"><table><thead><tr><th>Позиция / группа</th>{headings}</tr></thead><tbody>{''.join(rows)}<tr><th>Итого к производству</th>{totals}</tr><tr><th>Погода</th>{weather}</tr></tbody></table></div></section>'''
+
+
+def render_weather_status(strategy: dict[str, Any] | None) -> str:
+    if not strategy:
+        return ''
+    source = escape(str(strategy.get('weather_source', 'нет данных')))
+    updated = escape(str(strategy.get('weather_updated_at') or 'нет данных'))
+    stale = ' Используется сохраненный устаревший прогноз.' if strategy.get('weather_stale') else ''
+    periods = strategy.get('future_orders', [])
+    days = periods[0]['daily_totals'] if periods else []
+    available = sum(bool(day['weather_available']) for day in days)
+    status = f'Есть данные на {available} из {len(days)} дней ближайшего заказа.' if days else 'Нет периода заказа.'
+    missing = strategy.get('unavailable_reports', [])
+    warning = ('<p class="alert-chip">Расчет неполный: недоступные отчеты пропущены: '
+               + escape('; '.join(missing)) + '. Проверьте архив отчетов.</p>') if missing else ''
+    return f'''{warning}<section class="calculation-box"><h3>Как учитывается погода</h3>
+    <p>Источник: {source}. Обновление: {updated}.{stale} {status}</p>
+    <p>Дождь меняет поток покупателей; температура и осадки дополнительно корректируют категории. Коэффициент ×1 означает отсутствие изменения, ×0,9 — снижение на 10%. Если прогноза на дату нет, применяется ×1. Для заказа точный коэффициент позиции указан в «Подробнее», для «Кулинарии ТТ» — в каждой ячейке.</p></section>'''
+
+
 def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     events = payload["events"][:14]
     budget = payload["budget"]
@@ -1557,8 +1872,10 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     culinary_strategy = (
         render_culinary_strategy_html(payload.get("culinary_strategy"))
         if view == "analytics"
-        else render_orders_workspace(payload.get("culinary_strategy"))
+        else (render_production_workspace(payload.get("culinary_strategy")) if view == 'production'
+              else render_orders_workspace(payload.get("culinary_strategy")))
     )
+    culinary_strategy = render_weather_status(payload.get('culinary_strategy')) + culinary_strategy
 
     return f"""<!doctype html>
 <html lang="ru">
@@ -1669,7 +1986,10 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     .eyebrow {{ display: block; color: var(--green); font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 5px; }}
     .order-focus {{ padding: 22px; }}
     .order-focus h2 {{ font-size: 25px; margin-bottom: 5px; }}
+    .order-totals {{ display: grid; grid-template-columns: repeat(3, minmax(120px, 1fr)); gap: 8px; min-width: 430px; }}
     .order-total {{ min-width: 150px; padding: 14px 18px; border-radius: 10px; background: var(--green); color: white; display: grid; grid-template-columns: auto auto; align-items: baseline; gap: 0 8px; }}
+    .order-total.supplier {{ background: #265f8f; }}
+    .order-total.production {{ background: #7a5230; }}
     .order-total span {{ grid-column: 1 / -1; font-size: 12px; opacity: .8; }}
     .order-total strong {{ font-size: 36px; line-height: 1; }}
     .order-total small {{ opacity: .8; }}
@@ -1681,6 +2001,9 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     .order-table th span, .order-table td span {{ display: block; color: var(--muted); font-size: 11px; margin-top: 3px; }}
     .order-table .number {{ text-align: right; font-variant-numeric: tabular-nums; }}
     .order-table .total-cell {{ font-weight: 800; color: var(--green); }}
+    .type-chip {{ display: inline-block; padding: 5px 8px; border-radius: 999px; font-size: 12px; font-weight: 800; white-space: nowrap; }}
+    .type-chip.supplier {{ background: #e7f0f8; color: #265f8f; }}
+    .type-chip.production {{ background: #f4ece4; color: #7a5230; }}
     .menu-coverage {{ margin: 16px 0; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: #fbfaf7; }}
     .coverage-summary {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 10px; }}
     .coverage-summary.four {{ grid-template-columns: repeat(4, 1fr); }}
@@ -1691,6 +2014,9 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     .menu-coverage summary {{ cursor: pointer; font-weight: 800; color: var(--green); }}
     .mini-table {{ margin-top: 8px; font-size: 13px; }}
     .mini-table .number {{ text-align: right; font-variant-numeric: tabular-nums; }}
+    .calculation-box {{ margin: 16px 0; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }}
+    .calculation-box h3 {{ margin: 0 0 10px; }}
+    .calculation-box ol {{ margin: 0; padding-left: 20px; line-height: 1.55; color: var(--muted); }}
     .detail-button {{ border: 0; background: transparent; color: var(--green); cursor: pointer; font-weight: 700; padding: 6px; }}
     .next-orders {{ margin-top: 16px; }}
     .section-title {{ display: flex; justify-content: space-between; align-items: end; gap: 12px; }}
@@ -1704,6 +2030,11 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     .dialog-close {{ position: absolute; right: 16px; top: 12px; border: 0; background: transparent; font-size: 28px; cursor: pointer; }}
     #dialog-content h2 {{ font-size: 22px; }}
     #dialog-content p {{ white-space: pre-line; line-height: 1.6; color: var(--muted); }}
+    .detail-panel dl {{ display: grid; grid-template-columns: 150px 1fr; gap: 8px 12px; margin: 16px 0; }}
+    .detail-panel dt {{ font-weight: 800; color: var(--ink); }}
+    .detail-panel dd {{ margin: 0; color: var(--muted); }}
+    .detail-panel h3 {{ margin-top: 18px; font-size: 16px; }}
+    .detail-panel ul {{ padding-left: 20px; color: var(--muted); line-height: 1.5; }}
     .workspace-head {{
       display: flex;
       justify-content: space-between;
@@ -1864,7 +2195,9 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
       header {{ align-items: start; flex-direction: column; }}
       .grid, .metrics, .category-strip, .next-order-grid {{ grid-template-columns: 1fr; }}
       .workspace-head {{ flex-direction: column; }}
+      .order-totals {{ grid-template-columns: 1fr; min-width: 0; width: 100%; }}
       .tabs {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .detail-panel dl {{ grid-template-columns: 1fr; }}
       .tabs label {{ text-align: center; }}
       table {{ font-size: 13px; }}
       th, td {{ padding: 8px 6px; }}
@@ -1877,7 +2210,7 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
       <div>
         <h1>Заказы кулинарии</h1>
         <div class="muted">Обеды, салаты, роллы и горячие блюда на ближайшие периоды</div>
-        <nav><a class="{'active' if view == 'orders' else ''}" href="/">Заказы</a><a class="{'active' if view == 'analytics' else ''}" href="/analytics">Аналитика</a><a href="/menu">Меню</a><a href="/reports">Отчёты</a><a href="/settings">Настройки</a></nav>
+        <nav><a class="{'active' if view == 'orders' else ''}" href="/">Заказы</a><a class="{'active' if view == 'production' else ''}" href="/production">Кулинария ТТ</a><a class="{'active' if view == 'analytics' else ''}" href="/analytics">Аналитика</a><a href="/menu">Меню</a><a href="/reports">Отчёты</a><a href="/settings">Настройки</a></nav>
       </div>
       <div><a href="/reports">Ежемесячные отчеты</a><div class="muted">{payload["start_day"]} · {payload["horizon_days"]} дней</div></div>
     </header>
@@ -1936,22 +2269,72 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     const dialog = document.getElementById('item-dialog');
     document.querySelectorAll('.detail-button').forEach(button => button.addEventListener('click', () => {{
       const content = document.getElementById('dialog-content');
-      content.replaceChildren();
-      const label = document.createElement('span'); label.className = 'eyebrow'; label.textContent = 'Детали позиции';
-      const title = document.createElement('h2'); title.textContent = button.dataset.name;
-      const details = document.createElement('p'); details.textContent = button.dataset.details;
-      content.append(label, title, details);
-      dialog.showModal();
+      const template = button.parentElement.querySelector('template');
+      content.replaceChildren(template ? template.content.cloneNode(true) : document.createTextNode('Детали недоступны'));
+      if (typeof dialog.showModal === 'function') {{
+        dialog.showModal();
+      }} else {{
+        dialog.setAttribute('open', 'open');
+      }}
     }}));
-    document.querySelector('.dialog-close')?.addEventListener('click', () => dialog.close());
-    dialog?.addEventListener('click', event => {{ if (event.target === dialog) dialog.close(); }});
+    const closeDialog = () => {{
+      if (!dialog) return;
+      if (typeof dialog.close === 'function') {{
+        dialog.close();
+      }} else {{
+        dialog.removeAttribute('open');
+      }}
+    }};
+    document.querySelector('.dialog-close')?.addEventListener('click', closeDialog);
+    dialog?.addEventListener('click', event => {{ if (event.target === dialog) closeDialog(); }});
   </script>
 </body>
 </html>"""
 
 
+def selected_upload_files(parts: list[tuple[str, str | None, bytes]]) -> list[tuple[str, bytes]]:
+    files = [(filename, content) for name, filename, content in parts if name == 'file' and filename]
+    if not files:
+        raise ReportValidationError('Выберите XLSX-файлы.')
+    if len(files) > MAX_BATCH_FILES:
+        raise ReportValidationError(f'За один раз можно загрузить не более {MAX_BATCH_FILES} файлов.')
+    if sum(len(content) for _, content in files) > MAX_BATCH_UPLOAD_BYTES:
+        raise ReportValidationError(f'Общий размер файлов превышает {MAX_BATCH_UPLOAD_MB} МБ.')
+    return files
+
+
+def save_upload_batch(files: list[tuple[str, bytes]], save: Any) -> tuple[str, str]:
+    saved = []
+    errors = []
+    for filename, content in files:
+        try:
+            validate_report_content('sales', filename, content)
+            save(filename, content)
+            saved.append(Path(filename).name)
+        except (ReportValidationError, OSError) as error:
+            errors.append(f'{Path(filename).name}: {error}')
+    return (f'Загружено: {len(saved)} из {len(files)}. ' + '; '.join(saved), '; '.join(errors))
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        self._serve_request(self._handle_get)
+
+    def do_POST(self) -> None:
+        self._serve_request(self._handle_post)
+
+    def _serve_request(self, action: Any) -> None:
+        try:
+            action()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except ReportValidationError:
+            self._send_error_page(HTTPStatus.SERVICE_UNAVAILABLE, 'Не удалось прочитать отчеты. Проверьте подключение и доступность файлов в разделе «Отчёты».')
+        except Exception as error:
+            self.log_message('request_failed: %s', type(error).__name__)
+            self._send_error_page(HTTPStatus.INTERNAL_SERVER_ERROR, 'Не удалось выполнить запрос. Обновите страницу или проверьте доступность отчетов.')
+
+    def _handle_get(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/health":
             self._send_json({"status": "ok"})
@@ -1983,6 +2366,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/analytics":
             self._send_html(render_dashboard_html(_payload_from_query(parsed.query), view="analytics"))
             return
+        if parsed.path == '/production':
+            self._send_html(render_dashboard_html(_payload_from_query(parsed.query), view='production'))
+            return
         if parsed.path == "/menu":
             params = parse_qs(parsed.query)
             self._send_html(
@@ -2005,7 +2391,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         self._send_error_page(HTTPStatus.NOT_FOUND, "Страница не найдена")
 
-    def do_POST(self) -> None:
+    def _handle_post(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/setup":
             if has_database_config() and not self._authorize():
@@ -2025,24 +2411,38 @@ class DashboardHandler(BaseHTTPRequestHandler):
             toggle_menu_item(DEFAULT_MENU_STATE_PATH, fields.get("name", ""), fields.get("action") == "enable")
             self._redirect(f"/menu?message={_url_quote('Меню обновлено')}")
             return
+        if parsed.path == "/menu/supply":
+            fields = self._read_form_urlencoded()
+            toggle_menu_supply_type(
+                DEFAULT_MENU_STATE_PATH,
+                fields.get("name", ""),
+                fields.get("type") == "own_production",
+            )
+            self._redirect(f"/menu?message={_url_quote('Тип позиции обновлен')}")
+            return
         if parsed.path == "/menu/upload":
             try:
-                filename, content = self._read_xlsx_upload()
-                saved = save_menu_order_upload(filename, content, DEFAULT_PREVIOUS_ORDERS_DIR)
+                parts = self._read_multipart_parts()
+                files = selected_upload_files(parts)
             except ReportValidationError as error:
                 self._redirect(f"/menu?error={_url_quote(str(error))}")
                 return
-            self._redirect(f"/menu?message={_url_quote(f'Загружен файл меню {saved.name}')}")
+            successes, errors = save_upload_batch(files, lambda name, content: save_menu_order_upload(name, content, DEFAULT_PREVIOUS_ORDERS_DIR))
+            self._redirect(f"/menu?message={_url_quote(successes)}&error={_url_quote(errors)}")
             return
         if parsed.path != "/reports/upload":
             self._send_error_page(HTTPStatus.NOT_FOUND, "Страница не найдена")
             return
         try:
-            report = self._read_upload()
+            parts = self._read_multipart_parts()
+            files = selected_upload_files(parts)
+            fields = {name: content for name, filename, content in parts if filename is None}
+            report_type = fields.get('report_type', b'').decode('utf-8', errors='replace')
         except ReportValidationError as error:
             self._redirect(f"/reports?error={_url_quote(str(error))}")
             return
-        self._redirect(f"/reports?message={_url_quote(f'Загружен отчет {report.original_name}')}")
+        successes, errors = save_upload_batch(files, lambda name, content: REPORT_STORAGE.save(report_type, name, content))
+        self._redirect(f"/reports?message={_url_quote(successes)}&error={_url_quote(errors)}")
 
     def _read_form_urlencoded(self) -> dict[str, str]:
         try:
@@ -2069,11 +2469,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return filename, content
 
     def _read_multipart_fields(self) -> dict[str, tuple[str | None, bytes]]:
+        return {name: (filename, content) for name, filename, content in self._read_multipart_parts()}
+
+    def _read_multipart_parts(self) -> list[tuple[str, str | None, bytes]]:
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
         except ValueError as error:
             raise ReportValidationError("Некорректный размер запроса.") from error
-        if content_length <= 0 or content_length > MAX_UPLOAD_BYTES + 64 * 1024:
+        if content_length <= 0 or content_length > MAX_BATCH_UPLOAD_BYTES + 256 * 1024:
             raise ReportValidationError("Размер запроса превышает допустимый лимит.")
         content_type = self.headers.get("Content-Type", "")
         if not content_type.startswith("multipart/form-data"):
@@ -2082,12 +2485,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         message = BytesParser(policy=policy.default).parsebytes(
             f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode() + body
         )
-        fields: dict[str, tuple[str | None, bytes]] = {}
+        fields: list[tuple[str, str | None, bytes]] = []
         for part in message.iter_parts():
             name = part.get_param("name", header="content-disposition")
             if not name:
                 continue
-            fields[name] = (part.get_filename(), part.get_payload(decode=True) or b"")
+            fields.append((name, part.get_filename(), part.get_payload(decode=True) or b""))
         return fields
 
     def _send_report_file(self, report_id: str) -> None:
@@ -2278,7 +2681,7 @@ section{{background:white;border-radius:14px;padding:22px;margin:18px 0;box-shad
 th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}}button{{font:inherit;padding:8px 10px;border:0;border-radius:8px;cursor:pointer}}
 .primary{{background:#176b55;color:white}}.secondary{{background:#eceff1;color:#17202a}}.muted{{color:#607069}}.ok{{color:#176b55}}a{{color:#176b55}}
 .disabled{{color:#7a7f86;background:#fafafa}}.number{{text-align:right;font-variant-numeric:tabular-nums}}
-</style></head><body><main><p><a href="/">← Заказы</a> · <a href="/analytics">Аналитика</a> · <a href="/reports">Отчёты</a></p>
+</style></head><body><main><p><a href="/">← Заказы</a> · <a href="/production">Кулинария ТТ</a> · <a href="/analytics">Аналитика</a> · <a href="/reports">Отчёты</a></p>
 <h1>Управление меню</h1>{notice}
 <section><p class="muted">Источник меню: лист «Кулинария» из папки «Прошлые заказы». В расчет заказов попадают только включенные позиции.</p>
 <p><strong>{enabled_count}</strong> включено из <strong>{len(items)}</strong> позиций.</p></section>
@@ -2328,8 +2731,8 @@ input,select,button{{font:inherit;padding:10px}}button{{background:#176b55;color
 </style></head><body><main><p><a href="/">← К прогнозу</a></p><h1>Ежемесячная отчетность</h1>
 {notice}{failure}<section><h2>Загрузить файл</h2><form method="post" action="/reports/upload" enctype="multipart/form-data">
 <label for="report_type">Тип отчета</label><select id="report_type" name="report_type"><option value="sales">Продажи</option><option value="waste">Списания</option></select>
-<label for="file">Файл XLSX</label><input id="file" name="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
-<p><button type="submit">Загрузить отчет</button></p></form><p>Максимальный размер — 10 МБ. Период определяется по датам внутри книги.</p></section>
+<label for="file">Файл XLSX</label><input id="file" name="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple required>
+<p><button type="submit">Загрузить отчеты</button></p></form><p>До {MAX_BATCH_FILES} файлов за один раз, не более {MAX_BATCH_UPLOAD_MB} МБ суммарно и 10 МБ на файл. Можно выбрать ежедневные отчеты сразу за месяц. Каждый файл проверяется отдельно; ошибки не отменяют успешно загруженные файлы. Период определяется по датам внутри книги.</p></section>
 <section><h2>Архив файлов</h2><table><thead><tr><th>Тип</th><th>Период</th><th>Файл</th><th>Размер</th><th></th></tr></thead><tbody>{rows}</tbody></table></section>
 </main></body></html>"""
 
@@ -2396,7 +2799,7 @@ def render_settings_html() -> str:
 <title>Настройки прогноза</title><style>
 body{font-family:Inter,Segoe UI,Arial,sans-serif;background:#f6f2ec;color:#20231f;margin:0}main{max-width:820px;margin:30px auto;padding:0 20px}
 section{background:white;border:1px solid #ded8ce;border-radius:10px;padding:22px;margin:18px 0}dt{font-weight:700;margin-top:14px}dd{margin:4px 0;color:#687069}a{color:#365f4c}
-</style></head><body><main><p><a href="/">← Заказы</a> · <a href="/analytics">Аналитика</a> · <a href="/reports">Отчёты</a></p>
+</style></head><body><main><p><a href="/">← Заказы</a> · <a href="/production">Кулинария ТТ</a> · <a href="/analytics">Аналитика</a> · <a href="/reports">Отчёты</a></p>
 <h1>Настройки</h1><section><h2>Текущая конфигурация</h2><dl>
 <dt>Город</dt><dd>Санкт-Петербург, 59.9343 / 30.3351</dd>
 <dt>Погода</dt><dd>MET Norway, обновление раз в 180 минут</dd>
@@ -2420,12 +2823,12 @@ section{{background:white;border-radius:14px;padding:22px;margin:18px 0;box-shad
 th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}}button{{font:inherit;padding:8px 10px;border:0;border-radius:8px;cursor:pointer}}
 input{{font:inherit;padding:10px}}.primary{{background:#176b55;color:white}}.secondary{{background:#eceff1;color:#17202a}}.muted{{color:#607069}}.ok{{color:#176b55}}.error{{color:#b42318}}a{{color:#176b55}}
 .disabled{{color:#7a7f86;background:#fafafa}}.number{{text-align:right;font-variant-numeric:tabular-nums}}
-</style></head><body><main><p><a href="/">← Заказы</a> · <a href="/analytics">Аналитика</a> · <a href="/reports">Отчёты</a></p>
+</style></head><body><main><p><a href="/">← Заказы</a> · <a href="/production">Кулинария ТТ</a> · <a href="/analytics">Аналитика</a> · <a href="/reports">Отчёты</a></p>
 <h1>Управление меню</h1>{notice}{failure}
 <section><h2>Добавить данные</h2><form method="post" action="/menu/upload" enctype="multipart/form-data">
 <label for="file">XLSX-файл заказа в производство</label>
-<p><input id="file" name="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required></p>
-<p><button class="primary" type="submit">Загрузить заказ</button></p>
+<p><input id="file" name="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple required></p>
+<p><button class="primary" type="submit">Загрузить заказы</button></p>
 </form><p class="muted">Нужен файл с листом «Кулинария» и колонками «Артикул», «Товар», «К-во фасовок» или «Общее к-во». После загрузки позиции сразу появятся ниже.</p></section>
 <section><p class="muted">Источник меню: лист «Кулинария» из загруженных прошлых заказов. В расчет заказов попадают только включенные позиции.</p>
 <p><strong>{enabled_count}</strong> включено из <strong>{len(items)}</strong> позиций.</p></section>
@@ -2504,12 +2907,12 @@ section{{background:white;border-radius:14px;padding:22px;margin:18px 0;box-shad
 th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}}button{{font:inherit;padding:8px 10px;border:0;border-radius:8px;cursor:pointer}}
 input{{font:inherit;padding:10px}}.primary{{background:#176b55;color:white}}.secondary{{background:#eceff1;color:#17202a}}.muted{{color:#607069}}.ok{{color:#176b55}}.error{{color:#b42318}}a{{color:#176b55}}
 .disabled{{color:#7a7f86;background:#fafafa}}.badge{{display:inline-block;padding:4px 7px;border-radius:999px;background:#e7efe9;color:#176b55;font-size:12px;font-weight:700}}.number{{text-align:right;font-variant-numeric:tabular-nums}}
-</style></head><body><main><p><a href="/">← Заказы</a> · <a href="/analytics">Аналитика</a> · <a href="/reports">Отчёты</a></p>
+</style></head><body><main><p><a href="/">← Заказы</a> · <a href="/production">Кулинария ТТ</a> · <a href="/analytics">Аналитика</a> · <a href="/reports">Отчёты</a></p>
 <h1>Управление меню</h1>{notice}{failure}
 <section><h2>Добавить данные</h2><form method="post" action="/menu/upload" enctype="multipart/form-data">
 <label for="file">XLSX-файл заказа в производство</label>
-<p><input id="file" name="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required></p>
-<p><button class="primary" type="submit">Загрузить заказ</button></p>
+<p><input id="file" name="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple required></p>
+<p><button class="primary" type="submit">Загрузить заказы</button></p>
 </form><p class="muted">Нужен файл с листом «Кулинария» и колонками «Артикул», «Товар», «К-во фасовок» или «Общее к-во».</p></section>
 <section><p class="muted">Позиции со звездочкой в исходном файле помечаются как «Собственное» и не попадают в расчет заказа.</p>
 <p><strong>{enabled_count}</strong> в заказе, <strong>{own_count}</strong> собственное, всего <strong>{len(items)}</strong> позиций.</p></section>
@@ -2529,6 +2932,153 @@ def _render_menu_row(item: Any) -> str:
 <input type="hidden" name="action" value="{action}">
 <button class="{button_class}" type="submit">{button_label}</button>
 </form>"""
+    return f"""<tr{row_class}>
+<td>{status}</td>
+<td>{item_type}</td>
+<td>{escape(item.group)}</td>
+<td>{escape(item.sku)}</td>
+<td>{escape(item.name)}</td>
+<td class="number">{item.times_ordered}</td>
+<td class="number">{_format_number(float(item.average_order_quantity))}</td>
+<td>{control}</td>
+</tr>"""
+
+
+def _render_menu_coverage_block(coverage: dict[str, Any]) -> str:
+    if not coverage:
+        return ""
+    outside = coverage.get("outside_menu", {"items": 0, "quantity": 0, "rows": []})
+    disabled = coverage.get("disabled", {"items": 0, "quantity": 0, "rows": []})
+    own = coverage.get("own_production", {"items": 0, "quantity": 0, "rows": []})
+    in_menu = coverage.get("in_menu", {"items": 0, "quantity": 0, "rows": []})
+    outside_rows = _render_menu_coverage_rows(outside.get("rows", []), empty="Вне меню позиций не найдено.")
+    disabled_rows = _render_menu_coverage_rows(disabled.get("rows", []), empty="Отключенных позиций с продажами не найдено.")
+    own_rows = _render_menu_coverage_rows(own.get("rows", []), empty="Собственных позиций с продажами не найдено.")
+    return f"""
+      <div class="menu-coverage">
+        <div class="coverage-summary four">
+          <div><span>В поставку</span><strong>{in_menu.get("items", 0)} поз. / {in_menu.get("quantity", 0)} шт.</strong></div>
+          <div><span>Собственное</span><strong>{own.get("items", 0)} поз. / {own.get("quantity", 0)} шт.</strong></div>
+          <div><span>Вне меню</span><strong>{outside.get("items", 0)} поз. / {outside.get("quantity", 0)} шт.</strong></div>
+          <div><span>Исключено</span><strong>{disabled.get("items", 0)} поз. / {disabled.get("quantity", 0)} шт.</strong></div>
+        </div>
+        <details {"open" if int(own.get("items", 0)) else ""}>
+          <summary>Собственная продукция: попадает в план производства, но не в поставку</summary>
+          <table class="mini-table"><thead><tr><th>Позиция</th><th>Категория</th><th>Продажи</th><th>Причина</th></tr></thead><tbody>{own_rows}</tbody></table>
+        </details>
+        <details {"open" if int(outside.get("items", 0)) else ""}>
+          <summary>Позиции вне меню, которые могут объяснять расхождение</summary>
+          <table class="mini-table"><thead><tr><th>Позиция</th><th>Категория</th><th>Продажи</th><th>Причина</th></tr></thead><tbody>{outside_rows}</tbody></table>
+        </details>
+        <details>
+          <summary>Исключенные позиции с продажами</summary>
+          <table class="mini-table"><thead><tr><th>Позиция</th><th>Категория</th><th>Продажи</th><th>Причина</th></tr></thead><tbody>{disabled_rows}</tbody></table>
+        </details>
+      </div>
+    """
+
+
+def render_menu_html(items: list[Any], message: str = "", error: str = "") -> str:
+    rows = "".join(_render_menu_row(item) for item in items) or (
+        "<tr><td colspan='8'>Позиции меню пока не найдены. Загрузите XLSX-файл заказа в производство.</td></tr>"
+    )
+    notice = f"<p class='ok'>{escape(message)}</p>" if message else ""
+    failure = f"<p class='error'>{escape(error)}</p>" if error else ""
+    enabled_count = sum(1 for item in items if item.enabled)
+    own_count = sum(1 for item in items if item.own_production)
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Управление меню</title><style>
+body{{font-family:Arial,sans-serif;background:#f5f6f8;color:#17202a;margin:0}}main{{max-width:1180px;margin:30px auto;padding:0 20px}}
+section{{background:white;border-radius:14px;padding:22px;margin:18px 0;box-shadow:0 4px 18px #00000010}}table{{width:100%;border-collapse:collapse}}
+th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}}button{{font:inherit;padding:8px 10px;border:0;border-radius:8px;cursor:pointer}}
+input{{font:inherit;padding:10px}}.primary{{background:#176b55;color:white}}.secondary{{background:#eceff1;color:#17202a}}.muted{{color:#607069}}.ok{{color:#176b55}}.error{{color:#b42318}}a{{color:#176b55}}
+.disabled{{color:#7a7f86;background:#fafafa}}.badge{{display:inline-block;padding:4px 7px;border-radius:999px;background:#e7efe9;color:#176b55;font-size:12px;font-weight:700}}.number{{text-align:right;font-variant-numeric:tabular-nums}}
+</style></head><body><main><p><a href="/">← Заказы</a> · <a href="/production">Кулинария ТТ</a> · <a href="/analytics">Аналитика</a> · <a href="/reports">Отчёты</a></p>
+<h1>Управление меню</h1>{notice}{failure}
+<section><h2>Добавить данные</h2><form method="post" action="/menu/upload" enctype="multipart/form-data">
+<label for="file">XLSX-файл заказа в производство</label>
+<p><input id="file" name="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple required></p>
+<p><button class="primary" type="submit">Загрузить заказы</button></p>
+</form><p class="muted">Нужен файл с листом «Кулинария» и колонками «Артикул», «Товар», «К-во фасовок» или «Общее к-во».</p></section>
+<section><p class="muted">Позиции со звездочкой в исходном файле помечаются как «Собственное». Они попадают в прогноз, но выводятся в блок производства, а не поставки.</p>
+<p><strong>{enabled_count}</strong> участвует в прогнозе, <strong>{own_count}</strong> собственное, всего <strong>{len(items)}</strong> позиций.</p></section>
+<section><table><thead><tr><th>Статус</th><th>Тип</th><th>Группа</th><th>Артикул</th><th>Позиция</th><th>Заказы</th><th>Среднее</th><th></th></tr></thead><tbody>{rows}</tbody></table></section>
+</main></body></html>"""
+
+
+def _render_menu_row(item: Any) -> str:
+    action = "disable" if item.enabled else "enable"
+    button_label = "Исключить из расчета" if item.enabled else "Вернуть в расчет"
+    button_class = "secondary" if item.enabled else "primary"
+    item_type = "<span class='badge'>Собственное</span>" if item.own_production else "Поставка"
+    status = "в прогнозе" if item.enabled else "исключено"
+    row_class = "" if item.enabled else " class='disabled'"
+    control = f"""<form method="post" action="/menu/toggle">
+<input type="hidden" name="name" value="{escape(item.normalized_name)}">
+<input type="hidden" name="action" value="{action}">
+<button class="{button_class}" type="submit">{button_label}</button>
+</form>"""
+    return f"""<tr{row_class}>
+<td>{status}</td>
+<td>{item_type}</td>
+<td>{escape(item.group)}</td>
+<td>{escape(item.sku)}</td>
+<td>{escape(item.name)}</td>
+<td class="number">{item.times_ordered}</td>
+<td class="number">{_format_number(float(item.average_order_quantity))}</td>
+<td>{control}</td>
+</tr>"""
+
+
+def render_menu_html(items: list[Any], message: str = "", error: str = "") -> str:
+    rows = "".join(_render_menu_row(item) for item in items) or (
+        "<tr><td colspan='8'>Позиции меню пока не найдены. Загрузите XLSX-файл заказа в производство.</td></tr>"
+    )
+    notice = f"<p class='ok'>{escape(message)}</p>" if message else ""
+    failure = f"<p class='error'>{escape(error)}</p>" if error else ""
+    enabled_count = sum(1 for item in items if item.enabled)
+    own_count = sum(1 for item in items if item.own_production)
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Управление меню</title><style>
+body{{font-family:Arial,sans-serif;background:#f5f6f8;color:#17202a;margin:0}}main{{max-width:1180px;margin:30px auto;padding:0 20px}}
+section{{background:white;border-radius:14px;padding:22px;margin:18px 0;box-shadow:0 4px 18px #00000010}}table{{width:100%;border-collapse:collapse}}
+th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}}button{{font:inherit;padding:8px 10px;border:0;border-radius:8px;cursor:pointer}}
+input{{font:inherit;padding:10px}}.primary{{background:#176b55;color:white}}.secondary{{background:#eceff1;color:#17202a}}.muted{{color:#607069}}.ok{{color:#176b55}}.error{{color:#b42318}}a{{color:#176b55}}
+.disabled{{color:#7a7f86;background:#fafafa}}.badge{{display:inline-block;padding:4px 7px;border-radius:999px;background:#e7efe9;color:#176b55;font-size:12px;font-weight:700}}.number{{text-align:right;font-variant-numeric:tabular-nums}}
+.actions{{display:flex;gap:8px;flex-wrap:wrap}}.actions form{{display:inline}}
+</style></head><body><main><p><a href="/">← Заказы</a> · <a href="/production">Кулинария ТТ</a> · <a href="/analytics">Аналитика</a> · <a href="/reports">Отчёты</a></p>
+<h1>Управление меню</h1>{notice}{failure}
+<section><h2>Добавить данные</h2><form method="post" action="/menu/upload" enctype="multipart/form-data">
+<label for="file">XLSX-файл заказа в производство</label>
+<p><input id="file" name="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple required></p>
+<p><button class="primary" type="submit">Загрузить заказы</button></p>
+</form><p class="muted">Нужен файл с листом «Кулинария» и колонками «Артикул», «Товар», «К-во фасовок» или «Общее к-во».</p></section>
+<section><p class="muted">Звездочка в исходном файле считается технической пометкой и не меняет тип позиции. Тип «Поставка» или «Собственное» задается вручную здесь.</p>
+<p><strong>{enabled_count}</strong> участвует в прогнозе, <strong>{own_count}</strong> собственное, всего <strong>{len(items)}</strong> позиций.</p></section>
+<section><table><thead><tr><th>Статус</th><th>Тип</th><th>Группа</th><th>Артикул</th><th>Позиция</th><th>Заказы</th><th>Среднее</th><th></th></tr></thead><tbody>{rows}</tbody></table></section>
+</main></body></html>"""
+
+
+def _render_menu_row(item: Any) -> str:
+    action = "disable" if item.enabled else "enable"
+    button_label = "Исключить из расчета" if item.enabled else "Вернуть в расчет"
+    button_class = "secondary" if item.enabled else "primary"
+    next_type = "supplier" if item.own_production else "own_production"
+    supply_button = "Сделать поставкой" if item.own_production else "Сделать собственным"
+    item_type = "<span class='badge'>Собственное</span>" if item.own_production else "Поставка"
+    status = "в прогнозе" if item.enabled else "исключено"
+    row_class = "" if item.enabled else " class='disabled'"
+    control = f"""<div class="actions"><form method="post" action="/menu/toggle">
+<input type="hidden" name="name" value="{escape(item.normalized_name)}">
+<input type="hidden" name="action" value="{action}">
+<button class="{button_class}" type="submit">{button_label}</button>
+</form><form method="post" action="/menu/supply">
+<input type="hidden" name="name" value="{escape(item.normalized_name)}">
+<input type="hidden" name="type" value="{next_type}">
+<button class="secondary" type="submit">{supply_button}</button>
+</form></div>"""
     return f"""<tr{row_class}>
 <td>{status}</td>
 <td>{item_type}</td>

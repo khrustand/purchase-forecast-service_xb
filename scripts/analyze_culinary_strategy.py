@@ -28,7 +28,7 @@ DAILY_MENU_QUOTAS = {
     "Супы": 8,
     "Горячее": 9,
 }
-FLEX_MENU_CATEGORIES = {"Завтраки", "Салаты"}
+FLEX_MENU_CATEGORIES = {"Завтраки", "Салаты", "Роллы"}
 FLEX_MENU_TARGET = 17
 HIGH_WASTE_RISK = "высокий риск списаний"
 
@@ -118,6 +118,22 @@ def main() -> int:
 
 
 def extract_items(rows: list[list[str | None]], start: date, end: date) -> list[DailySalesItem]:
+    daily_period = daily_sales_period(rows)
+    if daily_period is not None:
+        day = daily_period[0]
+        if not start <= day <= end:
+            return []
+        items = []
+        for row in rows[4:]:
+            if len(row) < 5:
+                continue
+            category, name = clean(row[0]), clean(row[1])
+            if not category or not name or name.lower().startswith(('итого', 'всего')):
+                continue
+            quantity = number(row[4])
+            if quantity > 0 and category not in EXCLUDED_CATEGORIES:
+                items.append(DailySalesItem(category, name, {day: quantity}))
+        return items
     header = rows[5]
     date_columns = [
         (index, parsed)
@@ -150,6 +166,22 @@ def extract_items(rows: list[list[str | None]], start: date, end: date) -> list[
         items.append(DailySalesItem(current_category, name, by_date))
 
     return items
+
+
+def daily_sales_period(rows: list[list[str | None]]) -> tuple[date, date] | None:
+    """Распознать суточный отчет с количеством и выручкой вместо колонок дат."""
+    if len(rows) < 4 or rows[3][:2] != ['Категория', 'Элемент номенклатуры']:
+        return None
+    if len(rows[3]) < 5 or rows[3][4] != 'Количество':
+        return None
+    text = ' '.join(str(value or '') for row in rows[:3] for value in row)
+    match = re.search(r'За период:\s*с\s*(\d{2}\.\d{2}\.\d{4})\s*по\s*(\d{2}\.\d{2}\.\d{4})', text)
+    if not match:
+        raise ValueError('в суточном отчете не найден период')
+    start, end = (datetime.strptime(value, '%d.%m.%Y').date() for value in match.groups())
+    if start != end:
+        raise ValueError('сводный отчет за несколько дней не содержит разбивки продаж по датам')
+    return start, end
 
 
 def build_recommendations(

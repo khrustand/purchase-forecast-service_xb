@@ -34,6 +34,7 @@
 | --- | --- |
 | `src/app/` | Entry points фреймворка, routing, dependency wiring. |
 | `src/domain/` | Business entities, rules, use cases. |
+| `src/domain/production.py` | Ежедневный план собственного производства по истории продаж и переданным погодным коэффициентам, без файловых и сетевых зависимостей. |
 | `src/infrastructure/` | Database, external APIs, queues, filesystem, providers. |
 | `src/shared/` | Shared utilities, constants, types. |
 | `tests/` | Unit, integration и end-to-end tests. |

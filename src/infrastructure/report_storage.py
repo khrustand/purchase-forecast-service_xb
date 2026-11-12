@@ -15,7 +15,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-from scripts.analyze_culinary_strategy import excel_date, read_xlsx
+from scripts.analyze_culinary_strategy import daily_sales_period, excel_date, read_xlsx
 
 
 ALLOWED_REPORT_TYPES = {"sales": "Продажи", "waste": "Списания"}
@@ -146,6 +146,7 @@ class SupabaseReportStorage:
         self.bucket = bucket
         self.cache_root = cache_root or Path(os.getenv("REPORT_UPLOAD_DIR", "data/uploads")) / "supabase-cache"
         self.request = request or _default_request
+        self.unavailable_reports: dict[str, str] = {}
 
     def list(self) -> list[MonthlyReport]:
         payload = self._select_reports()
@@ -236,7 +237,12 @@ class SupabaseReportStorage:
         for item in self.list():
             if item.report_type != report_type:
                 continue
-            resolved = self.resolve(item.id)
+            self.unavailable_reports.pop(item.id, None)
+            try:
+                resolved = self.resolve(item.id)
+            except ReportValidationError:
+                self.unavailable_reports[item.id] = item.original_name
+                continue
             if resolved is not None:
                 paths.append(resolved[1])
         return paths
@@ -422,6 +428,9 @@ def validate_report_content(report_type: str, original_name: str, content: bytes
 def detect_period(path: Path, report_type: str) -> tuple[date, date]:
     rows = read_xlsx(path)
     if report_type == "sales":
+        daily_period = daily_sales_period(rows)
+        if daily_period is not None:
+            return daily_period
         if len(rows) < 7:
             raise ValueError("в отчете продаж нет строк данных")
         dates = [parsed for value in rows[5] for parsed in [excel_date(value)] if parsed]

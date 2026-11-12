@@ -1,5 +1,6 @@
 from datetime import date
 from pathlib import Path
+import tempfile
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -78,6 +79,69 @@ class WebServerTests(TestCase):
         self.assertEqual(orders[2]["start"], "2026-09-11")
         self.assertFalse(orders[0]["daily_totals"][0]["weather_available"])
 
+    def test_own_production_stays_in_forecast_as_production_plan(self) -> None:
+        from scripts.analyze_culinary_strategy import DAILY_MENU_QUOTAS, DailySalesItem
+        from src.domain.menu_catalog import MenuCatalogItem, MenuCatalogState, save_menu_state
+
+        own_item = MenuCatalogItem(
+            sku="own",
+            name="Own meal",
+            normalized_name="own meal",
+            group="Hot",
+            times_ordered=1,
+            average_order_quantity=5,
+            last_order_quantity=5,
+        )
+        supplier_item = MenuCatalogItem(
+            sku="supplier",
+            name="Supplier meal",
+            normalized_name="supplier meal",
+            group="Hot",
+            times_ordered=1,
+            average_order_quantity=5,
+            last_order_quantity=5,
+        )
+        category = next(iter(DAILY_MENU_QUOTAS))
+        own_sales = {date(2026, 6, day): 10 for day in range(1, 11)}
+        supplier_sales = {date(2026, 6, day): 30 for day in range(1, 11)}
+        sales_items = [
+            DailySalesItem(category, "Own meal", own_sales),
+            DailySalesItem(category, "Supplier meal", supplier_sales),
+        ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            sales_path = Path(directory) / "sales.xlsx"
+            sales_path.write_text("placeholder", encoding="utf-8")
+            menu_state_path = Path(directory) / "menu-state.json"
+            save_menu_state(menu_state_path, MenuCatalogState(disabled=set(), own_production={"own meal"}))
+            with patch.object(web_server, "DEFAULT_MENU_STATE_PATH", menu_state_path):
+                with patch.object(web_server, "build_menu_catalog", return_value=[own_item, supplier_item]):
+                    with patch.object(web_server, "read_xlsx", return_value=[]):
+                        with patch.object(web_server, "extract_items", return_value=sales_items):
+                            payload = web_server.build_culinary_strategy_payload(
+                                sales_path=sales_path,
+                                waste_path=Path("__missing_waste__"),
+                                shelf_life_path=Path("__missing_shelf__"),
+                                start_day=date(2026, 6, 1),
+                                end_day=date(2026, 6, 10),
+                                reference_day=date(2026, 6, 10),
+                            )
+
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        first_order = payload["future_orders"][0]
+        rows_by_name = {row["name"]: row for row in first_order["rows"]}
+        self.assertIn("Own meal", rows_by_name)
+        self.assertEqual(rows_by_name["Own meal"]["supply_type"], "own_production")
+        self.assertIn("Supplier meal", rows_by_name)
+        self.assertEqual(rows_by_name["Supplier meal"]["supply_type"], "supplier")
+        self.assertGreater(first_order["production_quantity"], 0)
+        self.assertGreater(first_order["supplier_quantity"], 0)
+        self.assertEqual(len(payload['production_days']), 7)
+        self.assertEqual(payload['production_days'][0]['date'], '2026-06-11')
+        self.assertEqual([row['name'] for row in payload['production_days'][0]['rows']], ['Own meal'])
+        self.assertEqual(payload['production_days'][0]['rows'][0]['quantity'], 10)
+
     def test_rain_impact_is_learned_and_bounded_below_dry_traffic(self) -> None:
         item = SimpleNamespace(by_date={
             date(2026, 6, 1): 100,
@@ -119,3 +183,7 @@ class WebServerTests(TestCase):
         self.assertIn("Следующие заказы", html)
         self.assertIn("Детали позиции", html)
         self.assertIn('href="/analytics"', html)
+        self.assertIn('class="calculation-box"', html)
+        self.assertIn('class="detail-panel"', html)
+        self.assertIn("<template>", html)
+        self.assertNotIn("data-details=", html)

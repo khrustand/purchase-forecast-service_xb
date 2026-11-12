@@ -91,3 +91,24 @@ class MenuPageTests(TestCase):
         self.assertEqual(coverage["outside_menu"]["items"], 1)
         self.assertEqual(coverage["outside_menu"]["quantity"], 5)
         self.assertEqual(coverage["outside_menu"]["rows"][0]["name"], "Позиция вне меню")
+
+    def test_coverage_ignores_other_product_groups_in_counts_and_rows(self):
+        from src.app.web_server import build_menu_coverage
+        sales = [SimpleNamespace(category=category, name=name, by_date={date(2026, 9, 1): quantity})
+                 for category, name, quantity in [
+                     ('Кофе', 'Капучино', 1000), ('Упаковка', 'Пакет', 2000),
+                     ('Слоеные изделия', 'Сосиска в тесте', 800),
+                     ('Кулинария производство', 'Новый суп', 5),
+                     ('Кулинария. Готовка на ТТ', 'Новый салат', 3)]]
+        coverage = build_menu_coverage(sales, [])
+        self.assertEqual(coverage['outside_menu']['items'], 2)
+        self.assertEqual(coverage['outside_menu']['quantity'], 8)
+        self.assertEqual(coverage['in_menu']['items'], 0)
+        self.assertEqual({r['name'] for r in coverage['outside_menu']['rows']}, {'Новый суп', 'Новый салат'})
+
+    def test_explicit_menu_item_is_kept_despite_nonstandard_report_category(self):
+        from src.app.web_server import build_menu_coverage
+        sales = [SimpleNamespace(category='Другая категория', name='Суп', by_date={date(2026, 9, 1): 5})]
+        menu = [SimpleNamespace(normalized_name='суп', enabled=True, own_production=False)]
+        coverage = build_menu_coverage(sales, menu)
+        self.assertEqual(coverage['in_menu']['quantity'], 5)
