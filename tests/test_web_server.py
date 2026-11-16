@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 import tempfile
 from unittest import TestCase
@@ -11,6 +11,21 @@ from src.app.web_server import _rain_sales_impact, build_dashboard_payload, rend
 
 
 class WebServerTests(TestCase):
+    def setUp(self):
+        from tests.synthetic_sales import dashboard_fixture
+        fixture = dashboard_fixture(web_server)
+        fixture.__enter__()
+        self.addCleanup(fixture.__exit__, None, None, None)
+
+    def test_default_query_preserves_evening_planning_start(self):
+        with patch.object(web_server, 'build_dashboard_payload') as build:
+            web_server._payload_from_query('')
+        self.assertIsNone(build.call_args.kwargs['start_day'])
+        with patch.object(web_server, 'build_culinary_strategy_payload', return_value=None) as strategy:
+            payload=build_dashboard_payload(now=datetime(2026,11,16,18,1))
+        self.assertEqual(payload['start_day'], '2026-11-17')
+        self.assertEqual(strategy.call_args.kwargs['production_start_day'],date(2026,11,17))
+
     def test_server_port_prefers_platform_port(self) -> None:
         with patch.dict("os.environ", {"PORT": "10000", "APP_PORT": "8000"}, clear=True):
             self.assertEqual(server_port(), 10000)
@@ -21,7 +36,8 @@ class WebServerTests(TestCase):
 
     def test_builds_dashboard_payload(self) -> None:
         with patch.object(web_server, "DEFAULT_PREVIOUS_ORDERS_DIR", Path("__missing_previous_orders__")):
-            payload = build_dashboard_payload(start_day=date(2026, 8, 4), horizon_days=14)
+            payload = build_dashboard_payload(start_day=date(2026, 8, 4), horizon_days=14,
+                                              now=datetime(2026, 8, 2, 12))
 
         self.assertEqual(payload["start_day"], "2026-08-04")
         self.assertEqual(payload["order_cycle_days"], 2)
@@ -31,7 +47,7 @@ class WebServerTests(TestCase):
         self.assertIsNotNone(payload["culinary_strategy"])
         self.assertEqual(payload["culinary_strategy"]["period"], "2026-06-01..2026-08-03")
         self.assertEqual(payload["culinary_strategy"]["weather_city"], "Санкт-Петербург")
-        self.assertEqual(payload["culinary_strategy"]["summary"]["target_total"], 34)
+        self.assertEqual(payload["culinary_strategy"]["summary"]["target_total"], 32)
         self.assertEqual(payload["culinary_strategy"]["future_orders"][0]["label"], "Ср+Чт")
         self.assertEqual(payload["culinary_strategy"]["future_orders"][0]["start"], "2026-08-05")
         self.assertEqual(payload["culinary_strategy"]["future_orders"][1]["label"], "Пт+Сб+Вс")
@@ -59,7 +75,8 @@ class WebServerTests(TestCase):
 
     def test_builds_forecast_for_selected_current_date(self) -> None:
         with patch.object(web_server, "DEFAULT_PREVIOUS_ORDERS_DIR", Path("__missing_previous_orders__")):
-            payload = build_dashboard_payload(start_day=date(2026, 8, 19), horizon_days=7)
+            payload = build_dashboard_payload(start_day=date(2026, 8, 19), horizon_days=7,
+                                              now=datetime(2026, 8, 17, 12))
 
         current_order = payload["culinary_strategy"]["future_orders"][0]
         self.assertEqual(current_order["label"], "Ср+Чт")
@@ -71,7 +88,8 @@ class WebServerTests(TestCase):
 
     def test_builds_next_order_windows_from_september_sixth(self) -> None:
         with patch.object(web_server, "DEFAULT_PREVIOUS_ORDERS_DIR", Path("__missing_previous_orders__")):
-            payload = build_dashboard_payload(start_day=date(2026, 9, 6), horizon_days=14)
+            payload = build_dashboard_payload(start_day=date(2026, 9, 6), horizon_days=14,
+                                              now=datetime(2026, 9, 4, 12))
 
         orders = payload["culinary_strategy"]["future_orders"]
         self.assertEqual(orders[0]["start"], "2026-09-07")
@@ -116,7 +134,8 @@ class WebServerTests(TestCase):
             save_menu_state(menu_state_path, MenuCatalogState(disabled=set(), own_production={"own meal"}))
             with patch.object(web_server, "DEFAULT_MENU_STATE_PATH", menu_state_path):
                 with patch.object(web_server, "build_menu_catalog", return_value=[own_item, supplier_item]):
-                    with patch.object(web_server, "read_xlsx", return_value=[]):
+                    with patch('src.infrastructure.report_analytics.read_xlsx', return_value=[]), patch.object(web_server, "read_xlsx", return_value=[]), patch.object(web_server, "dish_economics", return_value={
+                        'start': '2026-06-01', 'end': '2026-06-10', 'rows': [], 'detailed_waste_days': 0}):
                         with patch.object(web_server, "extract_items", return_value=sales_items):
                             payload = web_server.build_culinary_strategy_payload(
                                 sales_path=sales_path,
@@ -131,8 +150,7 @@ class WebServerTests(TestCase):
         assert payload is not None
         first_order = payload["future_orders"][0]
         rows_by_name = {row["name"]: row for row in first_order["rows"]}
-        self.assertIn("Own meal", rows_by_name)
-        self.assertEqual(rows_by_name["Own meal"]["supply_type"], "own_production")
+        self.assertNotIn("Own meal", rows_by_name)
         self.assertIn("Supplier meal", rows_by_name)
         self.assertEqual(rows_by_name["Supplier meal"]["supply_type"], "supplier")
         self.assertGreater(first_order["production_quantity"], 0)
@@ -140,7 +158,8 @@ class WebServerTests(TestCase):
         self.assertEqual(len(payload['production_days']), 7)
         self.assertEqual(payload['production_days'][0]['date'], '2026-06-11')
         self.assertEqual([row['name'] for row in payload['production_days'][0]['rows']], ['Own meal'])
-        self.assertEqual(payload['production_days'][0]['rows'][0]['quantity'], 10)
+        self.assertEqual(payload['production_days'][0]['rows'][0]['guest_quantity'], 10)
+        self.assertEqual(first_order['staff_quantity'], first_order['days'] * 5)
 
     def test_rain_impact_is_learned_and_bounded_below_dry_traffic(self) -> None:
         item = SimpleNamespace(by_date={
@@ -179,7 +198,8 @@ class WebServerTests(TestCase):
             html = render_dashboard_html(build_dashboard_payload(start_day=date(2026, 9, 6), horizon_days=14))
 
         self.assertIn("Ближайший заказ", html)
-        self.assertIn("Позиции вне меню", html)
+        self.assertNotIn('id="reconciliation"', html)
+        self.assertIn("Заказ до", html)
         self.assertIn("Следующие заказы", html)
         self.assertIn("Детали позиции", html)
         self.assertIn('href="/analytics"', html)

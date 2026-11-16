@@ -38,7 +38,7 @@ class MenuCatalogState:
     own_production: set[str] | None = None
 
 
-def extract_order_menu_items(rows: list[list[str | None]]) -> list[MenuCatalogItem]:
+def extract_order_menu_items(rows: list[list[str | None]], include_unordered: bool = False) -> list[MenuCatalogItem]:
     header_index = _find_header_index(rows)
     if header_index is None:
         return []
@@ -55,7 +55,7 @@ def extract_order_menu_items(rows: list[list[str | None]]) -> list[MenuCatalogIt
         sku = clean(row[sku_index] if sku_index < len(row) else None)
         raw_name = clean(row[name_index] if name_index < len(row) else None)
         quantity = _row_quantity(row, package_index, total_index)
-        if not sku or not raw_name or quantity <= 0:
+        if not sku or not raw_name or (quantity <= 0 and not include_unordered):
             continue
         name = clean_menu_name(raw_name, sku)
         if not name or "снято" in name.lower():
@@ -66,7 +66,7 @@ def extract_order_menu_items(rows: list[list[str | None]]) -> list[MenuCatalogIt
                 name=name,
                 normalized_name=normalize_name(name),
                 group=classify_menu_group(name),
-                times_ordered=1,
+                times_ordered=1 if quantity > 0 else 0,
                 average_order_quantity=float(quantity),
                 last_order_quantity=int(quantity),
             )
@@ -78,7 +78,21 @@ def build_menu_catalog(order_dir: Path) -> list[MenuCatalogItem]:
     aggregate: dict[str, dict[str, object]] = {}
     if not order_dir.exists():
         return []
-    for path in sorted(order_dir.glob("*.xlsx")):
+    paths = sorted(order_dir.glob("*.xlsx"))
+    snapshots = []
+    for path in paths:
+        try:
+            rows = read_culinary_order_sheet(path)
+            index = _find_header_index(rows)
+            if index is not None and ('меню' in path.stem.casefold() or not any(
+                    clean(v).lower() in ('к-во фасовок', 'общее к-во') for v in rows[index])):
+                snapshots.append((path, rows))
+        except (ValueError, OSError, KeyError):
+            continue
+    if snapshots:
+        _, rows = max(snapshots, key=lambda entry: entry[0].stat().st_mtime_ns)
+        return sorted(extract_order_menu_items(rows, include_unordered=True), key=lambda item: (item.group, item.name))
+    for path in paths:
         try:
             rows = read_culinary_order_sheet(path)
         except Exception:
@@ -209,6 +223,22 @@ def classify_menu_group(name: str) -> str:
 
 
 def read_culinary_order_sheet(path: Path) -> list[list[str | None]]:
+    # Каталог может называться «Лист1» и не содержать количеств заказа.
+    from scripts.analyze_culinary_strategy import read_xlsx
+    try:
+        return _read_named_order_sheet(path)
+    except ValueError:
+        with ZipFile(path) as archive:
+            workbook = ET.fromstring(archive.read('xl/workbook.xml'))
+            names = [sheet.attrib['name'] for sheet in workbook.findall('a:sheets/a:sheet', MAIN_NS)]
+        for name in names:
+            rows = read_xlsx(path, name)
+            if _find_header_index(rows) is not None:
+                return rows
+        raise ValueError('В книге не найден лист с колонками «Артикул» и «Товар».')
+
+
+def _read_named_order_sheet(path: Path) -> list[list[str | None]]:
     with ZipFile(path) as archive:
         strings = shared_strings(archive)
         sheet_path = _select_sheet_by_prefix(archive, "Кулинария")

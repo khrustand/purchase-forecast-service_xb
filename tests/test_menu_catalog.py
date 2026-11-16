@@ -4,6 +4,26 @@ from unittest import TestCase
 
 
 class MenuCatalogTests(TestCase):
+    def test_snapshot_includes_unordered_and_excludes_retired(self):
+        from src.domain.menu_catalog import extract_order_menu_items
+        rows = [['Артикул', 'Товар'], ['1', '1 Суп новый'], ['2', '2 Суп снято']]
+        items = extract_order_menu_items(rows, include_unordered=True)
+        self.assertEqual([row.sku for row in items], ['1'])
+        self.assertEqual(items[0].times_ordered, 0)
+
+    def test_latest_snapshot_does_not_resurrect_old_or_retired_dishes(self):
+        from unittest.mock import patch
+        from src.domain.menu_catalog import build_menu_catalog
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'old.xlsx').write_bytes(b'old')
+            (root / 'current.xlsx').write_bytes(b'current')
+            history = [['Артикул', 'Товар', 'К-во фасовок'], ['old', 'Бывший суп', '10']]
+            current = [['Артикул', 'Товар'], ['new', 'Новый суп'], ['old', 'Бывший суп снято']]
+            with patch('src.domain.menu_catalog.read_culinary_order_sheet', side_effect=lambda p: current if p.name == 'current.xlsx' else history):
+                result = build_menu_catalog(root)
+        self.assertEqual([row.sku for row in result], ['new'])
+
     def test_extracts_order_items_without_treating_star_as_own_production(self) -> None:
         from src.domain.menu_catalog import extract_order_menu_items
 

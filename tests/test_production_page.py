@@ -10,6 +10,47 @@ from scripts.analyze_culinary_strategy import DailySalesItem
 
 
 class ProductionPageTests(TestCase):
+    def test_32_supplier_places_are_separate_from_five_tt_items(self):
+        tt = ['Каша овсяная 0,250', 'Каша рисовая 0,250', 'Омлет с ветчиной 0,200',
+              'Сырники классические 0,140', 'Запеканка 0,200']
+        names = [f'Суп {i}' for i in range(34)] + tt
+        catalog = [SimpleNamespace(name=name, normalized_name=name.casefold(), group='Супы',
+                                   enabled=True, own_production=name in tt) for name in names]
+        history = [DailySalesItem('Супы', name, {date(2026, 11, d): 3 for d in range(1, 15)}) for name in names]
+        with patch.object(web, 'REPORT_STORAGE') as storage, \
+             patch.object(web, 'load_met_norway_forecast', return_value=None), \
+             patch.object(web, 'build_menu_catalog', return_value=[]), \
+             patch.object(web, 'apply_menu_state', return_value=catalog), \
+             patch.object(web, 'load_menu_state', return_value=MenuCatalogState(disabled=set())), \
+             patch.object(web, 'load_candidates', return_value=[]), \
+             patch.object(web, 'read_xlsx', return_value=[]), \
+             patch('src.infrastructure.report_analytics.read_xlsx', return_value=[]), \
+             patch.object(web, 'dish_economics', return_value={
+                 'start': '2026-11-01', 'end': '2026-11-14', 'rows': [], 'detailed_waste_days': 0}), \
+             patch.object(web, 'extract_items', return_value=history):
+            storage.paths.side_effect = lambda kind: [Path('sales.xlsx')] if kind == 'sales' else []
+            storage.list.return_value = []
+            strategy = web.build_culinary_strategy_payload(reference_day=date(2026, 11, 17),
+                production_start_day=date(2026, 11, 16), shelf_life_path=Path('__missing__'), waste_path=Path('__missing__'))
+        order = strategy['future_orders'][0]
+        self.assertEqual(len(order['rows']), 32)
+        self.assertEqual(len(strategy['production_days'][0]['rows']), 5)
+        self.assertEqual(order['staff_quantity'], 10)
+        supplier_staff = sum(row['staff_quantity'] for row in order['rows'])
+        tt_staff = sum(row['staff_quantity'] for day in strategy['production_days']
+                       if order['start'] <= day['date'] <= order['end'] for row in day['rows'])
+        self.assertEqual(supplier_staff + tt_staff, 10)
+        self.assertEqual(sum(day['quantity'] for day in order['daily_totals']), order['total_quantity'])
+        for day in strategy['production_days']:
+            for row in day['rows']:
+                self.assertEqual(row['batch_size'], 1)
+                self.assertEqual(row['quantity'], row['model']['quantity'])
+                self.assertEqual(row['quantity'], row['guest_quantity'] + row['staff_quantity'] + row['batch_extra'])
+        for row in order['rows']:
+            self.assertEqual(row['forecast_quantity'], row['model']['quantity'])
+            self.assertEqual(row['model']['service_level'], .85)
+            self.assertEqual(row['display_extra'], 0)
+
     def test_only_enabled_own_items_including_items_without_sales(self):
         menu = [SimpleNamespace(normalized_name=name, name=name, group='Салаты', enabled=True, own_production=False)
                 for name in ('own', 'disabled', 'supplier', 'new')]
@@ -24,6 +65,9 @@ class ProductionPageTests(TestCase):
              patch.object(web, 'apply_menu_state', return_value=catalog), \
              patch.object(web, 'load_menu_state', return_value=MenuCatalogState(disabled={'disabled'})), \
              patch.object(web, 'read_xlsx', return_value=[]), \
+             patch('src.infrastructure.report_analytics.read_xlsx', return_value=[]), \
+             patch.object(web, 'dish_economics', return_value={
+                 'start': '2026-11-01', 'end': '2026-11-05', 'rows': [], 'detailed_waste_days': 0}), \
              patch.object(web, 'extract_items', return_value=history):
             storage.paths.side_effect = lambda kind: [Path('sales.xlsx')] if kind == 'sales' else []
             storage.list.return_value = []

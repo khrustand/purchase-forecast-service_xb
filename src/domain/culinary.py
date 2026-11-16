@@ -7,7 +7,7 @@ from math import ceil
 def is_culinary_category(category: str) -> bool:
     normalized = ' '.join(category.casefold().replace('ё', 'е').split())
     return normalized.startswith('кулинария') or normalized in {
-        'супы', 'горячее', 'салаты', 'завтраки', 'роллы', 'снэки',
+        'супы', 'горячее', 'салаты', 'завтраки', 'роллы',
     }
 
 

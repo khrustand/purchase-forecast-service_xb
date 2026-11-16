@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import subprocess
 import sys
 import threading
@@ -109,6 +110,9 @@ def wait_for_window_close(
 
 
 def main() -> int:
+    log_dir = Path(os.getenv('LOCALAPPDATA', str(runtime_base_dir()))) / 'PurchaseForecastService' / 'logs'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(filename=log_dir / 'app.log', encoding='utf-8', level=logging.ERROR)
     load_runtime_env(runtime_base_dir())
     port = os.environ.setdefault("APP_PORT", "8000")
     path = "" if has_database_config() else "/setup"

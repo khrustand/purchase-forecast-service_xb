@@ -5,11 +5,12 @@ import os
 import base64
 import hmac
 import re
+import logging
 from dataclasses import replace
 from email import policy
 from email.parser import BytesParser
 from html import escape
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,6 +18,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from src.app.cli import load_purchase_items
+from src.app.analytics_views import render_loss_kpi, render_matrix, render_traffic
+from src.app.demand_views import model_details, number, render_demand_method
 from src.domain.menu_catalog import (
     apply_menu_state,
     build_menu_catalog,
@@ -27,6 +30,7 @@ from src.domain.menu_catalog import (
 )
 from src.domain.planning import build_purchase_calendar, estimate_calendar_budget
 from src.domain.production import daily_production_plan
+from src.domain.demand_planning import plan_demand, recent_history, DEFAULT_SERVICE_LEVEL, DEFAULT_PROFIT_TOLERANCE
 from src.domain.culinary import is_culinary_category
 from scripts.analyze_culinary_strategy import (
     build_daily_menu,
@@ -46,6 +50,7 @@ from src.infrastructure.report_storage import (
     ReportValidationError,
     create_report_storage,
     validate_report_content,
+    SupabaseReportStorage,
 )
 from src.infrastructure.app_config import (
     AppConfigError,
@@ -55,13 +60,27 @@ from src.infrastructure.app_config import (
 )
 from src.infrastructure.paths import project_path
 from src.infrastructure.weather import load_met_norway_forecast
+from src.infrastructure.report_formats import is_detailed_waste, waste_lines, receipt_days
+from src.infrastructure.report_analytics import (
+    product_key, load_receipt_series, dish_economics, read_detailed_waste,
+    monthly_loss_kpi, traffic_history, loss_group_totals,
+)
+from src.infrastructure.assortment_catalog import load_candidates
+from src.infrastructure.menu_uploads import menu_upload_directory
+from src.domain.assortment import rank_profit_rows, propose_matrix
+from src.domain.order_policy import (
+    DISPLAY_CAPACITY, STAFF_PORTIONS, MOSCOW, moscow_now, earliest_delivery,
+    delivery_deadline,
+)
+from src.domain.traffic import traffic_adjustment, allocate_staff
 
 
 DEFAULT_ITEMS_PATH = project_path("data/examples/purchase_items.json")
 DEFAULT_SALES_PATH = project_path("data/local/culinary_sales_june_july.xlsx")
 DEFAULT_WASTE_PATH = project_path("data/local/culinary_waste_june_july.xlsx")
 DEFAULT_SHELF_LIFE_PATH = project_path("data/local/Хранение и сроки годности, реализации.xlsx")
-DEFAULT_PREVIOUS_ORDERS_DIR = project_path("Прошлые заказы")
+BUNDLED_PREVIOUS_ORDERS_DIR = project_path("Прошлые заказы")
+DEFAULT_PREVIOUS_ORDERS_DIR = menu_upload_directory()
 DEFAULT_MENU_STATE_PATH = project_path("data/menu/menu-state.json")
 DEFAULT_ORDER_CYCLE_DAYS = 2
 MAX_BATCH_FILES = 100
@@ -256,14 +275,21 @@ def build_dashboard_payload(
     items_path: Path = DEFAULT_ITEMS_PATH,
     start_day: date | None = None,
     horizon_days: int = 14,
+    now: datetime | None = None,
+    service_level: float = DEFAULT_SERVICE_LEVEL,
+    profit_tolerance: float = DEFAULT_PROFIT_TOLERANCE,
 ) -> dict[str, Any]:
-    start = start_day or date.today()
+    clock = now or moscow_now()
+    clock = clock.replace(tzinfo=MOSCOW) if clock.tzinfo is None else clock.astimezone(MOSCOW)
+    default_start = clock.date() + timedelta(days=1 if clock.hour >= 18 else 0)
+    start = max(start_day or default_start, clock.date())
+    delivery_start = earliest_delivery(clock, start)
     items = load_purchase_items(items_path)
     events = build_purchase_calendar(items, start, horizon_days)
     budget = estimate_calendar_budget(events)
 
     return {
-        "generated_at": date.today().isoformat(),
+        "generated_at": clock.date().isoformat(),
         "start_day": start.isoformat(),
         "horizon_days": horizon_days,
         "order_cycle_days": DEFAULT_ORDER_CYCLE_DAYS,
@@ -281,11 +307,11 @@ def build_dashboard_payload(
             for event in events
         ],
         "forecast_logic": [
-            "берем продажи и списания за последние периоды по каждой позиции",
-            "считаем средний спрос на 2 дня и добавляем страховой запас",
-            "вычитаем текущий остаток и подтвержденные поставки",
-            "округляем заказ до кратности поставщика или производственной партии",
-            "помечаем позиции с риском нехватки, списаний или нехваткой истории",
+            "оцениваем разброс продаж в недавних сопоставимых днях и окнах поставок",
+            "учитываем стоимость непроданной порции и упущенный вклад при нехватке",
+            "добавляем резерв к желаемому наличию в пределах допустимой цены потерь",
+            "распределяем пять порций питания в день между всей кулинарией один раз",
+            "проверяем срок годности и показываем неопределенность без технической кратности",
         ],
         "demand_factors": {
             "status": "демо-логика",
@@ -299,7 +325,9 @@ def build_dashboard_payload(
             "кратность заказа или производственной партии",
             "пометки по дням: будни, выходные, погода, акции, локальные события",
         ],
-        "culinary_strategy": build_culinary_strategy_payload(reference_day=start - timedelta(days=1)),
+        "culinary_strategy": build_culinary_strategy_payload(
+            reference_day=delivery_start - timedelta(days=1), production_start_day=start,
+            ordering_now=clock, service_level=service_level, profit_tolerance=profit_tolerance),
     }
 
 
@@ -311,6 +339,10 @@ def build_culinary_strategy_payload(
     end_day: date | None = None,
     order_days: int = DEFAULT_ORDER_CYCLE_DAYS,
     reference_day: date | None = None,
+    production_start_day: date | None = None,
+    ordering_now: datetime | None = None,
+    service_level: float = DEFAULT_SERVICE_LEVEL,
+    profit_tolerance: float = DEFAULT_PROFIT_TOLERANCE,
 ) -> dict[str, Any] | None:
     live_weather = load_met_norway_forecast()
     # Не оставляем предыдущий сетевой прогноз активным после отключения провайдера.
@@ -338,53 +370,187 @@ def build_culinary_strategy_payload(
     )
     actual_end_day = end_day or _latest_sales_day(scanned_items) or scan_end_day
     menu_state = load_menu_state(DEFAULT_MENU_STATE_PATH)
-    menu_catalog = apply_menu_state(build_menu_catalog(DEFAULT_PREVIOUS_ORDERS_DIR), menu_state)
-    enabled_names = enabled_menu_names(menu_catalog)
-    disabled_names = set(menu_state.disabled) | {item.normalized_name for item in menu_catalog if not item.enabled}
-    own_production_names = {item.normalized_name for item in menu_catalog if item.own_production}
+    menu_catalog = apply_menu_state(_read_menu_catalog(), menu_state)
+    enabled_names = {product_key(item.name) for item in menu_catalog if item.enabled}
+    disabled_names = {product_key(name) for name in menu_state.disabled} | {product_key(item.name) for item in menu_catalog if not item.enabled}
+    own_production_names = {product_key(item.name) for item in menu_catalog if item.own_production}
     menu_coverage = build_menu_coverage(scanned_items, menu_catalog)
     items = [
         item
         for item in scanned_items
-        if normalize_name(item.name) not in disabled_names
-        and (not enabled_names or normalize_name(item.name) in enabled_names)
+        if product_key(item.name) not in disabled_names
+        and (not enabled_names or product_key(item.name) in enabled_names)
+        and 'снэк' not in item.category.casefold() and 'снек' not in item.category.casefold()
     ]
     items = align_sales_with_menu(items, menu_catalog)
     uploaded_waste_paths = REPORT_STORAGE.paths("waste")
     effective_waste_paths = uploaded_waste_paths or ([waste_path] if allow_local_fallback and waste_path.exists() else [])
     waste_counts = _combined_waste_counts(effective_waste_paths, items, effective_start_day, actual_end_day)
     waste_by_date = _combined_waste_by_date(effective_waste_paths, items, effective_start_day, actual_end_day)
-    shelf_life = extract_shelf_life(shelf_life_path, items) if shelf_life_path.exists() else {}
+    shelf_life = {normalize_name(item.name): {'days': 3, 'source': 'Подтверждено пользователем: 3 дня'} for item in items}
+    for item in items:
+        if normalize_name(item.name).startswith(('онигири ', 'темаки ', 'блины ')):
+            shelf_life[normalize_name(item.name)] = {'days': 2, 'source': 'Подтверждено пользователем: 2 дня'}
     recommendations = build_recommendations(items, order_days, waste_counts, shelf_life)
+    economics = dish_economics(effective_sales_paths, effective_waste_paths,
+                              date(actual_end_day.year, actual_end_day.month, 1), actual_end_day)
+    profit_ranks = {row['key']: index for index,row in enumerate(rank_profit_rows(economics['rows']))}
+    known_economics = {row['key']: row for row in economics['rows']}
+    recommendations = [row for row in recommendations if product_key(str(row['name'])) not in known_economics
+                       or product_key(str(row['name'])) in profit_ranks]
+    recommendations.sort(key=lambda row: (profit_ranks.get(product_key(str(row['name'])), 10000),
+                                          -float(row['menu_score'])))
+    tt_prefixes = ('каша овсяная ', 'каша рисовая ', 'омлет с ветчиной ', 'сырники классические ', 'запеканка ')
+    recommendations = [row for row in recommendations
+                       if product_key(str(row['name'])) not in own_production_names
+                       and not product_key(str(row['name'])).startswith(tt_prefixes)]
     daily_menu = _with_supply_types(
-        _with_decision_explanations(build_daily_menu(recommendations)),
+        _with_decision_explanations(build_daily_menu(recommendations, ranked=True, capacity=DISPLAY_CAPACITY)),
         own_production_names,
     )
+    matrix = propose_matrix(load_candidates(menu_catalog), economics['rows'], DISPLAY_CAPACITY)
+    if len(matrix['rows']) == DISPLAY_CAPACITY and economics['rows'] and menu_catalog:
+        historical = {product_key(str(row['name'])): row for row in build_daily_menu(
+            recommendations, ranked=True, capacity=len(recommendations))}
+        selected = []
+        for candidate in matrix['rows']:
+            key = candidate['key']
+            row = historical.get(key)
+            if row is None and candidate['role'] != 'experiment':
+                continue
+            if row is None:
+                row = {'category': candidate['category'], 'name': candidate['name'], 'order_for_2_days': 3,
+                       'sales_june_july': 0, 'shelf_life_days': 2 if key.startswith(('онигири ', 'темаки ', 'блины ')) else 3,
+                       'waste_count': 0, 'waste_risk': 'нет истории: тест', 'active_days': 0,
+                       'average_per_day': 0, 'abc_class': 'новинка', 'stability': 'нет истории',
+                       'shelf_life_risk': 'контроль срока', 'menu_role': 'основная витрина',
+                       'strategy': 'Тест: 3 порции на поставку, спрос и маржа пока не подтверждены.'}
+            selected.append({**row, 'matrix_role': candidate['role'], 'is_experiment': candidate['role'] == 'experiment'})
+        daily_menu = _with_supply_types(_with_decision_explanations(selected), own_production_names)
     forecast_reference_day = reference_day or date.today() - timedelta(days=1)
     rain_impact = _rain_sales_impact(items, effective_start_day, actual_end_day)
+    receipts, receipt_conflicts = load_receipt_series(REPORT_STORAGE.paths('receipts'))
+    checks = {day: row.checks for day,row in receipts.items()}
 
-    production_start = forecast_reference_day + timedelta(days=1)
+    production_start = production_start_day or forecast_reference_day + timedelta(days=1)
     production_items = [
-        {'key': item.normalized_name, 'name': item.name, 'category': item.group}
+        {'key': product_key(item.name), 'name': item.name, 'category': item.group}
         for item in menu_catalog if item.enabled and item.own_production
+        and not any(tag in item.group.casefold() for tag in ('снэк', 'снек'))
     ]
+    for item in scanned_items:
+        key = product_key(item.name)
+        if key.startswith(tt_prefixes) and key not in disabled_names and key not in {p['key'] for p in production_items}:
+            production_items.append({'key': key, 'name': item.name, 'category': 'Завтраки'})
+            own_production_names.add(key)
     production_history: dict[str, dict[date, float]] = {}
     for item in scanned_items:
-        values = production_history.setdefault(normalize_name(item.name), {})
+        values = production_history.setdefault(product_key(item.name), {})
         for day, quantity in item.by_date.items():
             values[day] = values.get(day, 0) + quantity
     production_factors = {
         (item['key'], production_start + timedelta(days=offset)):
         _weather_factor(item['category'], [production_start + timedelta(days=offset)], float(rain_impact['applied_factor']))
-        for item in production_items for offset in range(7)
+        for item in production_items for offset in range(14)
     }
-    production = daily_production_plan(production_items, production_start, 7, production_history, production_factors)
+    production = daily_production_plan(production_items, production_start, 14, production_history, production_factors)
+    staff_plan = {}
+    staff_balance: dict[str, float] = {}
+    production_keys = {p['key'] for p in production_items}
+    supplier_menu = [row for row in daily_menu if product_key(str(row['name'])) not in production_keys]
+    for entry in production:
+        day = date.fromisoformat(entry['date'])
+        demand = {}
+        for row in supplier_menu:
+            key = product_key(str(row['name']))
+            if row.get('is_experiment'):
+                demand[key] = 0
+                continue
+            if day.weekday() == 6 and int(row.get('shelf_life_days', 3)) <= 2:
+                demand[key] = 0
+                continue
+            history = recent_history(production_history.get(key, {}), production_start)
+            matching = [q for d,q in history.items() if d < production_start and d.weekday() == day.weekday()]
+            values = matching or [q for d,q in history.items() if d < production_start]
+            demand[key] = sum(values) / len(values) if values else 0
+        for row in entry['rows']:
+            demand[row['key']] = float(row['base_quantity'] or 0)
+        staff_plan[entry['date']] = allocate_staff(demand, STAFF_PORTIONS, staff_balance)
+        for row in entry['rows']:
+            history = recent_history(production_history.get(row['key'], {}), production_start)
+            adjustment = traffic_adjustment(checks, history, day, production_start)
+            row['receipt_factor'] = adjustment['factor']
+            row['staff_quantity'] = staff_plan[entry['date']].get(row['key'], 0)
+            price, cost = _unit_economics(known_economics.get(row['key']))
+            model = plan_demand(history, [day], production_start, [row['staff_quantity']],
+                                [row['weather_factor'] * adjustment['factor']], price, cost, service_level,
+                                profit_tolerance=profit_tolerance)
+            row.update(model=model, quantity=model['quantity'], guest_quantity=model['guest_quantity'],
+                       need=model['quantity'], batch_size=1, batch_extra=0)
+        entry['total'] = sum(row['quantity'] or 0 for row in entry['rows'])
     for entry in production:
         day = date.fromisoformat(entry['date'])
         entry['weather'] = str(WEATHER_BY_DATE.get(day, {}).get('summary', 'нет прогноза; погодная поправка не применяется'))
 
+    future = _future_orders(items, supplier_menu, waste_by_date, forecast_reference_day, 4,
+                            float(rain_impact['applied_factor']), checks)
+    for period in future:
+        for row in period['rows']:
+            key = product_key(str(row['name']))
+            usable = min(period['days'], int(row['shelf_life_days']))
+            days = [date.fromisoformat(d['date']) for d in row['daily_forecast'][:usable]]
+            history = recent_history(production_history.get(key, {}), production_start)
+            staff = [staff_plan.get(str(day), {}).get(key, 0) for day in days]
+            factors, adjustments = [], []
+            for day in days:
+                adjustment = traffic_adjustment(checks, history, day, production_start)
+                adjustments.append(adjustment['factor'])
+                factors.append(_weather_factor(str(row['category']), [day], float(rain_impact['applied_factor'])) * adjustment['factor'])
+            price, cost = _unit_economics(known_economics.get(key))
+            model = plan_demand(history, days, production_start, staff, factors, price, cost,
+                                service_level, trial_quantity=3 if row.get('is_experiment') else None,
+                                profit_tolerance=profit_tolerance)
+            row['model'] = model
+            for index, entry in enumerate(row['daily_forecast']):
+                planned = model['daily'][index] if index < len(model['daily']) else {'quantity':0, 'guest_quantity':0, 'staff_quantity':0}
+                entry.update(planned, receipt_factor=adjustments[index] if index < usable else 1)
+            row['staff_quantity'] = sum(d['staff_quantity'] for d in row['daily_forecast'])
+            row['forecast_quantity'] = sum(d['quantity'] for d in row['daily_forecast'])
+            row['quantity_unknown'] = model['quantity'] is None
+            row['display_extra'] = 0
+            row['remaining_is_expiry_risk'] = usable >= int(row['shelf_life_days'])
+        period['deadline'] = delivery_deadline(date.fromisoformat(period['start'])).isoformat()
+        period['display_extra'] = sum(row['display_extra'] for row in period['rows'])
+        period['supplier_quantity'] = sum(row['forecast_quantity'] for row in period['rows'])
+        period['production_quantity'] = sum(d['total'] for d in production if period['start'] <= d['date'] <= period['end'])
+        period['total_quantity'] = period['supplier_quantity'] + period['production_quantity']
+        period['staff_quantity'] = sum(sum(staff_plan.get(d['date'], {}).values()) for d in period['daily_totals'])
+        for day in period['daily_totals']:
+            day['quantity'] = sum(next(d['quantity'] for d in row['daily_forecast'] if d['date'] == day['date']) for row in period['rows'])
+            day['quantity'] += sum(p['total'] for p in production if p['date'] == day['date'])
+
+    traffic_forecast = [dict(date=entry['date'], **traffic_adjustment(
+        checks, {day for item in items for day in item.by_date},
+        date.fromisoformat(entry['date']), production_start))
+        for period in future for entry in period['daily_totals']]
+
     return {
-        'production_days': production,
+        'production_days': production[:7],
+        'staff_daily_portions': STAFF_PORTIONS,
+        'receipt_days': len(checks),
+        'receipt_conflicts': receipt_conflicts,
+        'economics': economics,
+        'loss_kpi': monthly_loss_kpi(economics, receipts, loss_group_totals(
+            effective_sales_paths, effective_waste_paths,
+            date(actual_end_day.year, actual_end_day.month, 1), actual_end_day)),
+        'matrix_proposal': {**matrix, 'applied_to_order': len(daily_menu) == DISPLAY_CAPACITY and bool(economics['rows'])},
+        'menu_source': _menu_source_info(menu_catalog, known_economics),
+        'traffic_history': traffic_history(receipts, actual_end_day),
+        'traffic_forecast': traffic_forecast,
+        'ordering_now': ordering_now.isoformat() if ordering_now else None,
+        'demand_model': {'name': 'Спрос, прибыль и наличие', 'service_level': service_level,
+                         'profit_tolerance': profit_tolerance,
+                         'batch_constraints': False, 'stockout_times_known': False},
         'unavailable_reports': list(getattr(REPORT_STORAGE, 'unavailable_reports', {}).values()),
         "period": f"{effective_start_day.isoformat()}..{actual_end_day.isoformat()}",
         "weather_city": "Санкт-Петербург",
@@ -404,14 +570,7 @@ def build_culinary_strategy_payload(
         "category_totals": _category_totals(daily_menu),
         "role_groups": _group_menu_by_role(daily_menu),
         "retrospective_orders": _retrospective_orders(items, daily_menu, reference_day=forecast_reference_day),
-        "future_orders": _future_orders(
-            items,
-            daily_menu,
-            waste_by_date,
-            reference_day=forecast_reference_day,
-            count=4,
-            rain_traffic_factor=float(rain_impact["applied_factor"]),
-        ),
+        "future_orders": future,
         "rain_sales_impact": rain_impact,
         "weather_sales_summary": _weather_sales_summary(items, effective_start_day, actual_end_day),
         "waste_leaders": _with_decision_explanations(waste_leaders(recommendations, limit=12)),
@@ -420,16 +579,24 @@ def build_culinary_strategy_payload(
 
 def align_sales_with_menu(items: list[Any], menu_catalog: list[Any]) -> list[Any]:
     """Использовать рабочие группы меню, сохраняя исходные файлы отчетов."""
-    catalog = {item.normalized_name: item for item in menu_catalog}
+    catalog = {product_key(item.name): item for item in menu_catalog}
     groups = {'Супы', 'Горячее', 'Салаты', 'Завтраки', 'Роллы'}
     aligned = []
     for item in items:
-        menu_item = catalog.get(normalize_name(item.name))
+        menu_item = catalog.get(product_key(item.name))
         if menu_item is not None:
             item = replace(item, name=menu_item.name,
                            category=menu_item.group if menu_item.group in groups else item.category)
         aligned.append(item)
     return _merge_sales_items([aligned])
+
+
+def _unit_economics(row: dict | None) -> tuple[float | None, float | None]:
+    if not row or row.get('sold', 0) <= 0:
+        return None, None
+    price = row['revenue'] / row['sold']
+    cost = (row['revenue'] - row['gross_profit']) / row['sold']
+    return (price, cost) if price > 0 and 0 < cost <= price else (None, None)
 
 
 def _merge_sales_items(groups: list[list[Any]]) -> list[Any]:
@@ -449,15 +616,33 @@ def _merge_sales_items(groups: list[list[Any]]) -> list[Any]:
 
 
 def load_current_menu_catalog() -> list[Any]:
-    catalog = build_menu_catalog(DEFAULT_PREVIOUS_ORDERS_DIR)
+    catalog = _read_menu_catalog()
     return apply_menu_state(catalog, load_menu_state(DEFAULT_MENU_STATE_PATH))
 
 
+def _read_menu_catalog() -> list[Any]:
+    source = DEFAULT_PREVIOUS_ORDERS_DIR
+    if source == menu_upload_directory() and not list(source.glob('*.xlsx')):
+        source = BUNDLED_PREVIOUS_ORDERS_DIR
+    return build_menu_catalog(source)
+
+
+def _menu_source_info(menu_catalog: list[Any], economics: dict) -> dict:
+    paths = list(DEFAULT_PREVIOUS_ORDERS_DIR.glob('*.xlsx'))
+    latest = max(paths, key=lambda p: p.stat().st_mtime_ns) if paths else None
+    return {'filename': latest.name if latest else 'исторические заказы', 'available': len(menu_catalog),
+            'without_november_sales': [{'sku': getattr(item, 'sku', ''), 'name': item.name}
+                for item in menu_catalog if item.enabled and product_key(item.name) not in economics],
+            'notice': 'Перечень без количеств включает все активные блюда. Пометка «снято» исключает блюдо. Отсутствие продаж не доказывает, что блюдо новое.'}
+
+
 def build_menu_coverage(sales_items: list[Any], menu_items: list[Any]) -> dict[str, Any]:
-    menu_names = {item.normalized_name for item in menu_items}
-    enabled_names = {item.normalized_name for item in menu_items if item.enabled}
-    disabled_names = {item.normalized_name for item in menu_items if not item.enabled}
-    own_names = {item.normalized_name for item in menu_items if item.own_production}
+    menu_names = {product_key(item.normalized_name) for item in menu_items}
+    enabled_names = {product_key(item.normalized_name) for item in menu_items if item.enabled}
+    disabled_names = {product_key(item.normalized_name) for item in menu_items if not item.enabled}
+    own_names = {product_key(item.normalized_name) for item in menu_items if item.own_production}
+    own_names.update(product_key(item.name) for item in sales_items if product_key(item.name).startswith(
+        ('каша овсяная ', 'каша рисовая ', 'омлет с ветчиной ', 'сырники классические ', 'запеканка ')))
     buckets = {
         "in_menu": {"items": 0, "quantity": 0, "rows": []},
         "own_production": {"items": 0, "quantity": 0, "rows": []},
@@ -465,7 +650,9 @@ def build_menu_coverage(sales_items: list[Any], menu_items: list[Any]) -> dict[s
         "disabled": {"items": 0, "quantity": 0, "rows": []},
     }
     for item in sales_items:
-        normalized = normalize_name(item.name)
+        normalized = product_key(item.name)
+        if any(tag in item.category.casefold() for tag in ('снэк', 'снек')):
+            continue
         if normalized not in menu_names and not is_culinary_category(item.category):
             continue
         quantity = sum(int(value) for value in item.by_date.values())
@@ -498,6 +685,8 @@ def build_menu_coverage(sales_items: list[Any], menu_items: list[Any]) -> dict[s
         )[:12]
     return {
         **buckets,
+        'period_start': str(min((day for item in sales_items for day in item.by_date), default='')),
+        'period_end': str(max((day for item in sales_items for day in item.by_date), default='')),
         "menu_enabled_items": len(enabled_names),
         "menu_disabled_items": len(disabled_names),
         "menu_own_production_items": len(own_names),
@@ -507,7 +696,7 @@ def build_menu_coverage(sales_items: list[Any], menu_items: list[Any]) -> dict[s
 def _with_supply_types(items: list[dict[str, object]], own_production_names: set[str]) -> list[dict[str, object]]:
     result = []
     for item in items:
-        supply_type = "own_production" if normalize_name(str(item["name"])) in own_production_names else "supplier"
+        supply_type = "own_production" if product_key(str(item["name"])) in own_production_names else "supplier"
         result.append(
             {
                 **item,
@@ -523,6 +712,17 @@ def save_menu_order_upload(filename: str, content: bytes, target_dir: Path = DEF
         raise ReportValidationError("Для меню нужен XLSX-файл заказа в производство.")
     if not content:
         raise ReportValidationError("Файл пустой.")
+    from tempfile import TemporaryDirectory
+    from src.domain.menu_catalog import read_culinary_order_sheet, extract_order_menu_items
+    with TemporaryDirectory() as directory:
+        check_path = Path(directory) / 'menu.xlsx'
+        check_path.write_bytes(content)
+        try:
+            rows = read_culinary_order_sheet(check_path)
+            if not extract_order_menu_items(rows, include_unordered=True):
+                raise ValueError('нет доступных блюд с артикулом и названием')
+        except Exception as error:
+            raise ReportValidationError('Не удалось прочитать меню: нужны колонки «Артикул» и «Товар».') from error
     target_dir.mkdir(parents=True, exist_ok=True)
     safe_name = re.sub(r"[^A-Za-zА-Яа-яЁё0-9._ -]+", "_", Path(filename).name).strip()
     if not safe_name:
@@ -565,8 +765,18 @@ def _waste_counts_by_date(
     rows = read_xlsx(waste_path)
     normalized_names = [normalize_name(item.name) for item in items]
     counts = {name: {} for name in normalized_names}
+    if is_detailed_waste(rows):
+        for line in waste_lines(rows):
+            if line.staff or not start_day <= line.day <= end_day:
+                continue
+            for item_name in normalized_names:
+                if product_key(item_name) == product_key(line.name):
+                    counts[item_name][line.day] = counts[item_name].get(line.day, 0) + 1
+        return counts
     for row in rows[4:]:
         if len(row) < 4:
+            continue
+        if len(row) > 10 and any(word in str(row[10]).casefold() for word in ('сотрудник', 'персонал')):
             continue
         day = parse_datetime(row[0])
         if day is None or not (start_day <= day <= end_day):
@@ -706,6 +916,7 @@ def _future_orders(
     reference_day: date,
     count: int,
     rain_traffic_factor: float = 0.88,
+    checks: dict[date, int] | None = None,
 ) -> list[dict[str, object]]:
     starts = []
     cursor = reference_day + timedelta(days=1)
@@ -721,6 +932,7 @@ def _future_orders(
             sales_items,
             waste_by_date,
             rain_traffic_factor,
+            checks,
         )
         for start in starts
     ]
@@ -733,6 +945,7 @@ def _future_period(
     sales_items: list[Any],
     waste_by_date: dict[str, dict[date, int]],
     rain_traffic_factor: float,
+    checks: dict[date, int] | None = None,
 ) -> dict[str, object]:
     period_days = [period_start + timedelta(days=offset) for offset in range(days)]
     item_by_name = {item.name: item for item in sales_items}
@@ -771,10 +984,32 @@ def _future_period(
         for item in rows
     ]
     if days == 3:
+        for item in rows:
+            if int(item.get('shelf_life_days', 3)) <= 2:
+                for entry in item['daily_forecast'][2:]:
+                    entry['quantity'] = 0
+                    entry['shelf_life_note'] = 'Пятничная партия: только пятница и суббота'
+    if checks:
+        for item in rows:
+            source = item_by_name.get(str(item['name']))
+            for entry in item['daily_forecast']:
+                adjustment = traffic_adjustment(checks, source.by_date if source else {}, date.fromisoformat(entry['date']), period_start)
+                entry['receipt_factor'] = adjustment['factor']
+                entry['quantity'] = max(0, round(entry['quantity'] * adjustment['factor']))
+    if days == 3 or checks:
         rows = [
             {**item, "forecast_quantity": sum(int(day["quantity"]) for day in item["daily_forecast"])}
             for item in rows
         ]
+    for item in rows:
+        if item.get('is_experiment'):
+            usable = min(days, int(item['shelf_life_days']))
+            trial = _daily_distribution(None, str(item['category']), period_days[:usable], 3, rain_traffic_factor)
+            quantities = {entry['date']: entry['quantity'] for entry in trial}
+            for entry in item['daily_forecast']:
+                entry['quantity'] = quantities.get(entry['date'], 0)
+                entry['receipt_factor'] = 1.0
+            item['forecast_quantity'] = 3
     daily_totals = [
         {
             "date": day.isoformat(),
@@ -1012,7 +1247,7 @@ def _period_quantity(
 
 def _order_policy(period_days: list[date]) -> str:
     if len(period_days) >= 3:
-        return "трехдневное окно: пятница, суббота и воскресенье рассчитаны отдельно по истории соответствующего дня недели; позиции со сроком 2 дня требуют отдельного пополнения на воскресенье"
+        return "трехдневное окно: пятница, суббота и воскресенье рассчитаны отдельно по истории соответствующего дня недели; пятничные позиции со сроком 2 дня рассчитаны только на пятницу и субботу, без воскресного пополнения"
     return "двухдневное окно: считаем базовый объем на 2 дня"
 
 
@@ -1209,7 +1444,7 @@ def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
     )
     rows = "".join(_render_operational_row(item) for item in current["rows"])
     next_cards = "".join(
-        f"<a class='next-order-card' href='/?start={period['start']}&days=14'>"
+        f"<a class='next-order-card' href='/?start={period['start']}&days=14&service={round(strategy.get('demand_model', {}).get('service_level', DEFAULT_SERVICE_LEVEL) * 100)}&reserve_cost={round(strategy.get('demand_model', {}).get('profit_tolerance', DEFAULT_PROFIT_TOLERANCE) * 100)}'>"
         f"<span>{escape(str(period['label']))} · {escape(str(period['start']))}—{escape(str(period['end']))}</span>"
         f"<strong>{period['total_quantity']} шт.</strong><small>{escape(str(period['weather']))}</small></a>"
         for period in following
@@ -1217,14 +1452,13 @@ def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
     rain_days = sum(1 for day in current["daily_totals"] if day["rain"])
     missing_weather = sum(1 for day in current["daily_totals"] if not day["weather_available"])
     short_shelf = sum(1 for item in current["rows"] if int(item["shelf_life_days"]) < int(current["days"]))
-    menu_coverage = _render_menu_coverage_block(strategy.get("menu_coverage", {}))
     alerts = []
     if rain_days:
         alerts.append(f"Осадки повлияли на {rain_days} дн. заказа")
     if missing_weather:
         alerts.append(f"Нет прогноза погоды на {missing_weather} дн.")
     if short_shelf:
-        alerts.append(f"{short_shelf} поз. требуют дополнительной поставки")
+        alerts.append(f"{short_shelf} поз. с коротким сроком: воскресенье исключено")
     alert_html = "".join(f"<span class='alert-chip'>{escape(alert)}</span>" for alert in alerts) or "<span class='ok-chip'>Критичных предупреждений нет</span>"
     updated = strategy["weather_updated_at"] or "нет данных"
 
@@ -1236,8 +1470,11 @@ def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
         <div class="order-total"><span>Заказать</span><strong>{current['total_quantity']}</strong><small>штук</small></div>
       </div>
       <div class="daily-strip">{_render_daily_totals(current['daily_totals'])}</div>
+      <p>Заказ до <strong>{escape(str(current.get('deadline', ''))).replace('T', ' ')}</strong> (Москва).
+      Поставка утром до открытия. Правило: на послезавтра до 18:00 МСК, только Пн/Ср/Пт.</p>
+      <p>В плане питание сотрудников: {current.get('staff_quantity', 0)} порций по поставке и ТТ вместе.
+      Дополнение до рекомендуемых 3 порций на заказанную позицию: {current.get('display_extra', 0)} шт.; это запас для выкладки, а не дополнительный спрос.</p>
       <div class="alert-row">{alert_html}</div>
-      {menu_coverage}
       <div class="table-wrap">
         <table class="order-table"><thead><tr><th>Позиция</th>{day_headings}<th>Итого</th><th>Статус</th><th></th></tr></thead><tbody>{rows}</tbody></table>
       </div>
@@ -1285,7 +1522,7 @@ def _render_menu_coverage_rows(rows: list[dict[str, object]], empty: str) -> str
 
 
 def _render_operational_row(item: dict[str, object]) -> str:
-    day_cells = "".join(f"<td class='number'>{day['quantity']}</td>" for day in item["daily_forecast"])
+    day_cells = "".join(f"<td class='number'><strong>{day['quantity']}</strong><br><small>гости {day.get('guest_quantity', day['quantity'])} + питание {day.get('staff_quantity', 0)}</small></td>" for day in item["daily_forecast"])
     status = str(item.get("waste_risk", "контроль"))
     details = (
         f"Категория: {item['category']}\n"
@@ -1337,14 +1574,14 @@ def render_culinary_strategy_html(strategy: dict[str, Any] | None) -> str:
     <section class="workspace">
       <div class="workspace-head">
         <div>
-          <h2>Заказ кулинарии на {strategy["order_days"]} дня</h2>
+          <h2>Базовый расчет действующего меню</h2>
           <div class="muted">Период анализа: {strategy["period"]}</div>
         </div>
         <div class="pill">Меню: {summary["actual_total"]} / {summary["target_total"]}</div>
       </div>
 
       <div class="metrics compact">
-        <div class="metric"><span>Объем заказа</span><strong>{strategy["total_quantity"]} шт.</strong></div>
+        <div class="metric"><span>База на {strategy['order_days']} дня, до питания и поправок</span><strong>{strategy["total_quantity"]} шт.</strong></div>
         <div class="metric"><span>Недобор до цели</span><strong>{summary["shortfall"]} поз.</strong></div>
         <div class="metric"><span>Резерв с высоким риском</span><strong>{summary["high_risk_count"]} поз.</strong></div>
       </div>
@@ -1607,7 +1844,7 @@ def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
     )
     rows = "".join(_render_operational_row(item) for item in current["rows"])
     next_cards = "".join(
-        f"<a class='next-order-card' href='/?start={period['start']}&days=14'>"
+        f"<a class='next-order-card' href='/?start={period['start']}&days=14&service={round(strategy.get('demand_model', {}).get('service_level', DEFAULT_SERVICE_LEVEL) * 100)}&reserve_cost={round(strategy.get('demand_model', {}).get('profit_tolerance', DEFAULT_PROFIT_TOLERANCE) * 100)}'>"
         f"<span>{escape(str(period['label']))} · {escape(str(period['start']))}—{escape(str(period['end']))}</span>"
         f"<strong>{period['total_quantity']} шт.</strong>"
         f"<small>Поставка: {period.get('supplier_quantity', period['total_quantity'])} · Собственное: {period.get('production_quantity', 0)}</small>"
@@ -1624,7 +1861,7 @@ def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
     if missing_weather:
         alerts.append(f"Нет прогноза погоды на {missing_weather} дн.")
     if short_shelf:
-        alerts.append(f"{short_shelf} поз. требуют дополнительной поставки")
+        alerts.append(f"{short_shelf} поз. с коротким сроком: воскресенье исключено")
     alert_html = "".join(f"<span class='alert-chip'>{escape(alert)}</span>" for alert in alerts) or "<span class='ok-chip'>Критичных предупреждений нет</span>"
     updated = strategy["weather_updated_at"] or "нет данных"
 
@@ -1652,7 +1889,7 @@ def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
 
 
 def _render_operational_row(item: dict[str, object]) -> str:
-    day_cells = "".join(f"<td class='number'>{day['quantity']}</td>" for day in item["daily_forecast"])
+    day_cells = "".join(f"<td class='number'><strong>{day['quantity']}</strong><br><small>гости {day.get('guest_quantity', day['quantity'])} + питание {day.get('staff_quantity', 0)}</small></td>" for day in item["daily_forecast"])
     status = str(item.get("waste_risk", "контроль"))
     supply_type = str(item.get("supply_type", "supplier"))
     supply_label = "Собственное" if supply_type == "own_production" else "Поставка"
@@ -1688,7 +1925,7 @@ def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
     )
     rows = "".join(_render_operational_row(item) for item in current["rows"])
     next_cards = "".join(
-        f"<a class='next-order-card' href='/?start={period['start']}&days=14'>"
+        f"<a class='next-order-card' href='/?start={period['start']}&days=14&service={round(strategy.get('demand_model', {}).get('service_level', DEFAULT_SERVICE_LEVEL) * 100)}&reserve_cost={round(strategy.get('demand_model', {}).get('profit_tolerance', DEFAULT_PROFIT_TOLERANCE) * 100)}'>"
         f"<span>{escape(str(period['label']))} · {escape(str(period['start']))}—{escape(str(period['end']))}</span>"
         f"<strong>{period['total_quantity']} шт.</strong>"
         f"<small>Поставка: {period.get('supplier_quantity', period['total_quantity'])} · Собственное: {period.get('production_quantity', 0)}</small>"
@@ -1698,14 +1935,13 @@ def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
     rain_days = sum(1 for day in current["daily_totals"] if day["rain"])
     missing_weather = sum(1 for day in current["daily_totals"] if not day["weather_available"])
     short_shelf = sum(1 for item in current["rows"] if int(item["shelf_life_days"]) < int(current["days"]))
-    menu_coverage = _render_menu_coverage_block(strategy.get("menu_coverage", {}))
     alerts = []
     if rain_days:
         alerts.append(f"Осадки повлияли на {rain_days} дн. заказа")
     if missing_weather:
         alerts.append(f"Нет прогноза погоды на {missing_weather} дн.")
     if short_shelf:
-        alerts.append(f"{short_shelf} поз. требуют дополнительной поставки")
+        alerts.append(f"{short_shelf} поз. с коротким сроком: воскресенье исключено")
     alert_html = "".join(f"<span class='alert-chip'>{escape(alert)}</span>" for alert in alerts) or "<span class='ok-chip'>Критичных предупреждений нет</span>"
     updated = strategy["weather_updated_at"] or "нет данных"
 
@@ -1721,9 +1957,12 @@ def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
         </div>
       </div>
       <div class="daily-strip">{_render_daily_totals(current['daily_totals'])}</div>
+      <p>Заказ до <strong>{escape(str(current.get('deadline', ''))).replace('T', ' ')}</strong> (Москва).
+      Поставка утром до открытия. Правило: на послезавтра до 18:00 МСК, только Пн/Ср/Пт.</p>
+      <p>В плане питание сотрудников: {current.get('staff_quantity', 0)} порций по поставке и ТТ вместе.
+      Потребность рассчитана без технической кратности и минимальных партий. Резерв на колебания спроса указан в «Подробнее».</p>
       <div class="alert-row">{alert_html}</div>
       {_render_order_calculation_block(strategy, current)}
-      {menu_coverage}
       <div class="table-wrap">
         <table class="order-table"><thead><tr><th>Позиция</th><th>Тип</th>{day_headings}<th>Итого</th><th>Статус</th><th></th></tr></thead><tbody>{rows}</tbody></table>
       </div>
@@ -1741,16 +1980,16 @@ def _render_order_calculation_block(strategy: dict[str, Any], current: dict[str,
           <li><strong>Период:</strong> {escape(str(current['label']))}, {escape(str(current['start']))}—{escape(str(current['end']))}; окно {current['days']} дн.</li>
           <li><strong>База:</strong> продажи из отчетов за {escape(str(strategy['period']))}; нулевые отсутствующие дни не подставляются.</li>
           <li><strong>Меню:</strong> в расчет попадают включенные позиции меню; отключенные позиции исключаются вручную.</li>
-          <li><strong>Тип:</strong> поставка и собственное производство задаются вручную в разделе «Меню».</li>
-          <li><strong>Корректировки:</strong> срок годности ограничивает запас, списания уменьшают страховой запас, погода применяется только когда есть прогноз.</li>
-          <li><strong>Итог:</strong> прогноз по дням суммируется в общее количество к заказу.</li>
+          <li><strong>Тип:</strong> поставка и собственное производство задаются в «Меню»; подтвержденные 5 блюд ТТ считаются отдельно от 32 мест поставки.</li>
+          <li><strong>Корректировки:</strong> срок годности ограничивает окно спроса, чеки и погода применяются один раз. Частота прошлых списаний не вычитается из спроса: риск остатка оценивается отдельно, известные потери влияют на выбор блюд.</li>
+          <li><strong>Итог:</strong> экономический объем с резервом к желаемому наличию, ограниченным допустимой ценой потерь, + доля 5 порций питания в день. Партии и минимальные объемы для обычных блюд не применяются. Расчет показывает потребность; фактический доступный остаток здесь не вычитается.</li>
         </ol>
       </section>
     """
 
 
 def _render_operational_row(item: dict[str, object]) -> str:
-    day_cells = "".join(f"<td class='number'>{day['quantity']}</td>" for day in item["daily_forecast"])
+    day_cells = "".join(f"<td class='number'><strong>{'—' if item.get('quantity_unknown') else day['quantity']}</strong><br><small>гостям с резервом {day.get('guest_quantity', day['quantity'])} + питание {day.get('staff_quantity', 0)}<br>чеки ×{day.get('receipt_factor', 1)}</small></td>" for day in item["daily_forecast"])
     status = str(item.get("waste_risk", "контроль"))
     supply_type = str(item.get("supply_type", "supplier"))
     supply_label = "Собственное" if supply_type == "own_production" else "Поставка"
@@ -1759,7 +1998,7 @@ def _render_operational_row(item: dict[str, object]) -> str:
     return (
         f"<tr class='{supply_class}'><td><strong>{escape(str(item['name']))}</strong><span>{escape(str(item['category']))}</span></td>"
         f"<td><span class='type-chip {supply_class}'>{escape(supply_label)}</span></td>"
-        f"{day_cells}<td class='number total-cell'>{item['forecast_quantity']}</td>"
+        f"{day_cells}<td class='number total-cell'>{'нет данных' if item.get('quantity_unknown') else item['forecast_quantity']}</td>"
         f"<td><i class='{_risk_class(status)}'>{escape(status)}</i></td>"
         f"<td><button class='detail-button' data-name='{escape(str(item['name']), quote=True)}'>Подробнее</button><template>{details_html}</template></td></tr>"
     )
@@ -1790,6 +2029,7 @@ def _render_item_details(item: dict[str, object], supply_label: str) -> str:
         </dl>
         <h3>Разбивка по дням</h3>
         <ul>{daily_rows}</ul>
+        {model_details(item.get('model', {}), item.get('remaining_is_expiry_risk', True))}
       </div>
     """
 
@@ -1807,16 +2047,42 @@ def render_production_workspace(strategy: dict[str, Any] | None) -> str:
         for day in days:
             row = day['rows'][index]
             quantity = row['quantity'] if row['quantity'] is not None else 'нет данных'
-            base = 'нет данных' if row['base_quantity'] is None else f"{row['base_quantity']:.2f}"
-            cells.append(f"<td><strong>{quantity}</strong><br><small>база {base} × {row['weather_factor']}<br>{escape(row['basis'])}, наблюдений: {row['history_points']}</small></td>")
+            model = row.get('model', {})
+            risk = number(model.get('stockout_probability') * 100) if model.get('stockout_probability') is not None else '—'
+            cells.append(f"<td><strong>{quantity}</strong><br><small>средний спрос {number(model.get('expected_demand'))}; резерв {model.get('reserve', '—')}<br>гостям с резервом {row.get('guest_quantity', quantity)} + питание {row.get('staff_quantity', 0)}<br>остаток ≈{number(model.get('expected_remaining'))}; модельный риск нехватки {risk}%<br>погода ×{row['weather_factor']} · чеки ×{row.get('receipt_factor', 1)}<br>наблюдений {model.get('history_points', 0)}</small></td>")
         rows.append(f"<tr><td><strong>{escape(item['name'])}</strong><br>{escape(item['category'])}</td>{''.join(cells)}</tr>")
     totals = ''.join(f"<td><strong>{day['total']}</strong><br><small>без истории: {day['missing_history']}</small></td>" for day in days)
     weather = ''.join(f"<td><small>{escape(day['weather'])}</small></td>" for day in days)
     return f'''<section class="workspace"><h2>Кулинария ТТ</h2>
-    <form method="get" action="/production"><label>Начало плана <input type="date" name="start" value="{days[0]['date']}" required></label> <button type="submit">Рассчитать неделю</button></form>
-    <p>Ежедневный план на 7 дней. Только включенные позиции с типом «Собственное» из <a href="/menu">управления меню</a>, без квот поставщика.</p>
-    <p class="muted">База — средние продажи того же дня недели; если их нет, среднее по доступной истории до начала плана. Отсутствующие дни не считаются нулевыми. База × погода, округление до целого. Остатки, списания и размер партии здесь не вычитаются: перед приготовлением проверьте остаток. План не накапливает запас на несколько дней.</p>
+    <form method="get" action="/production"><input type="hidden" name="service" value="{round(strategy.get('demand_model', {}).get('service_level', DEFAULT_SERVICE_LEVEL) * 100)}"><input type="hidden" name="reserve_cost" value="{round(strategy.get('demand_model', {}).get('profit_tolerance', DEFAULT_PROFIT_TOLERANCE) * 100)}"><label>Начало плана <input type="date" name="start" value="{days[0]['date']}" required></label> <button type="submit">Рассчитать неделю</button></form>
+    <p>Ежедневный план на 7 дней. Собственные позиции меню и подтвержденные блюда ТТ: каши, омлет с ветчиной, запеканка, сырники. Готовить на текущий день, остаток на завтра не переносить. Без квот поставщика.</p>
+    <p class="muted">Весь указанный выпуск готовится к открытию, без условной второй партии. Техническая кратность сейчас не ограничивает расчет: здесь потребность по спросу, прибыли и риску нехватки. Сырники указаны в отчетных порциях «2 шт.», количество изделий вдвое больше. Отсутствующие дни не считаются нулевыми. Питание включено один раз. План на весь день: не готовьте его повторно сверх уже выпущенного.</p>
     <div class="table-wrap"><table><thead><tr><th>Позиция / группа</th>{headings}</tr></thead><tbody>{''.join(rows)}<tr><th>Итого к производству</th>{totals}</tr><tr><th>Погода</th>{weather}</tr></tbody></table></div></section>'''
+
+
+def render_staff_and_economics(strategy: dict[str, Any] | None, view: str) -> str:
+    if not strategy:
+        return ''
+    block = f'''<section class="calculation-box"><h3>Питание сотрудников и динамика спроса</h3>
+    <p>В план включено 5 порций сотрудникам в день, суммарно по поставке и ТТ. Питание отсутствует в реализации и списывается отдельными актами, поэтому добавляется к гостевому спросу. Выбор блюд оценивается по структуре продаж и может отличаться от факта.</p>
+    <p>Загружены чеки за {strategy.get('receipt_days', 0)} дней. Учитываются недавние одинаковые дни недели и аналог будущего дня год назад с поправкой на текущую динамику. Ограничение ×0,7…1,3. Конфликтов дат: {strategy.get('receipt_conflicts', 0)}. <a href="/analytics#traffic">История прошлого года и расчет потока</a>. Питание не входит в целевые списания 2%.</p></section>'''
+    source = strategy.get('menu_source', {})
+    missing = source.get('without_november_sales', [])
+    listing = ''.join(f"<li>{escape(str(row['sku']))} — {escape(row['name'])}</li>" for row in missing)
+    block = f'''<section class="calculation-box"><h3>Источник текущего ассортимента</h3>
+    <p>{escape(source.get('filename', ''))}: доступных блюд {source.get('available', 0)}; в матрице до 32, ТТ отдельно.
+    {escape(source.get('notice', ''))}</p><details><summary>Нет ноябрьских продаж: {len(missing)} блюд</summary><ul>{listing}</ul></details></section>''' + block
+    if view != 'analytics':
+        return render_demand_method(strategy, view) + block + render_loss_kpi(strategy.get('loss_kpi', {}))
+    economics = strategy.get('economics', {})
+    rows = ''.join(f"<tr><td>{escape(r['name'])}</td><td>{r['sold']:g}</td><td>{r['revenue']:.2f}</td><td>{r['gross_profit']:.2f}</td><td>{r['waste_quantity']:g}</td><td>{r['waste_cost']:.2f}</td><td>{r['staff_cost']:.2f}</td><td>{r['profit_after_known_costs']:.2f}</td><td>{r['margin_after_known_costs'] if r['margin_after_known_costs'] is not None else '—'}</td></tr>" for r in economics.get('rows', []))
+    return (render_demand_method(strategy, view) + block + render_loss_kpi(strategy.get('loss_kpi', {}))
+            + render_matrix(strategy.get('matrix_proposal', {}))
+            + render_traffic(strategy.get('traffic_history', {}), strategy.get('traffic_forecast', []))
+            + _render_menu_coverage_block(strategy.get('menu_coverage', {}))) + f'''<section><h2>Прибыль по каждому блюду после известных списаний</h2>
+    <p>{economics.get('start', '')}—{economics.get('end', '')}. Продажи: {economics.get('sales_days', 0)} дней; подробные акты: {economics.get('detailed_waste_days', 0)} дней.</p>
+    <p>{escape(economics.get('notice', ''))} Ноль в колонке акта означает отсутствие найденной строки, а не подтвержденное отсутствие потерь. Себестоимость проданного уже вычтена в валовой прибыли и второй раз не вычитается. Питание вычитается по известным отдельным актам; плановые 5 порций не заменяют фактическую стоимость.</p>
+    <div class="table-wrap"><table><thead><tr><th>Блюдо</th><th>Продано</th><th>Выручка, ₽</th><th>Валовая прибыль, ₽</th><th>Списано порций</th><th>Потери, ₽</th><th>Питание, ₽</th><th>После известных затрат, ₽</th><th>Маржа, %</th></tr></thead><tbody>{rows}</tbody></table></div></section>'''
 
 
 def render_weather_status(strategy: dict[str, Any] | None) -> str:
@@ -1841,6 +2107,8 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     events = payload["events"][:14]
     budget = payload["budget"]
     max_budget = max([*budget.values(), 1])
+    service_percent = round(payload.get('culinary_strategy', {}).get('demand_model', {}).get('service_level', DEFAULT_SERVICE_LEVEL) * 100) if payload.get('culinary_strategy') else 85
+    reserve_percent = round(payload.get('culinary_strategy', {}).get('demand_model', {}).get('profit_tolerance', DEFAULT_PROFIT_TOLERANCE) * 100) if payload.get('culinary_strategy') else 5
 
     budget_rows = "\n".join(
         f"""
@@ -1876,6 +2144,7 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
               else render_orders_workspace(payload.get("culinary_strategy")))
     )
     culinary_strategy = render_weather_status(payload.get('culinary_strategy')) + culinary_strategy
+    culinary_strategy += render_staff_and_economics(payload.get('culinary_strategy'), view)
 
     return f"""<!doctype html>
 <html lang="ru">
@@ -2210,7 +2479,7 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
       <div>
         <h1>Заказы кулинарии</h1>
         <div class="muted">Обеды, салаты, роллы и горячие блюда на ближайшие периоды</div>
-        <nav><a class="{'active' if view == 'orders' else ''}" href="/">Заказы</a><a class="{'active' if view == 'production' else ''}" href="/production">Кулинария ТТ</a><a class="{'active' if view == 'analytics' else ''}" href="/analytics">Аналитика</a><a href="/menu">Меню</a><a href="/reports">Отчёты</a><a href="/settings">Настройки</a></nav>
+        <nav><a class="{'active' if view == 'orders' else ''}" href="/?service={service_percent}&reserve_cost={reserve_percent}">Заказы</a><a class="{'active' if view == 'production' else ''}" href="/production?service={service_percent}&reserve_cost={reserve_percent}">Кулинария ТТ</a><a class="{'active' if view == 'analytics' else ''}" href="/analytics?service={service_percent}&reserve_cost={reserve_percent}">Аналитика</a><a href="/menu">Меню</a><a href="/reports">Отчёты</a><a href="/settings">Настройки</a></nav>
       </div>
       <div><a href="/reports">Ежемесячные отчеты</a><div class="muted">{payload["start_day"]} · {payload["horizon_days"]} дней</div></div>
     </header>
@@ -2331,6 +2600,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except ReportValidationError:
             self._send_error_page(HTTPStatus.SERVICE_UNAVAILABLE, 'Не удалось прочитать отчеты. Проверьте подключение и доступность файлов в разделе «Отчёты».')
         except Exception as error:
+            logging.getLogger(__name__).exception('request_failed')
             self.log_message('request_failed: %s', type(error).__name__)
             self._send_error_page(HTTPStatus.INTERNAL_SERVER_ERROR, 'Не удалось выполнить запрос. Обновите страницу или проверьте доступность отчетов.')
 
@@ -2586,15 +2856,16 @@ section{{background:white;border-radius:14px;padding:22px;box-shadow:0 4px 18px 
 def build_data_status(storage: Any | None = None) -> dict[str, Any]:
     active_storage = storage or REPORT_STORAGE
     reports = active_storage.list()
-    counts = {"sales": 0, "waste": 0}
-    readable_counts = {"sales": 0, "waste": 0}
+    counts = {key: 0 for key in ALLOWED_REPORT_TYPES}
+    readable_counts = {key: 0 for key in ALLOWED_REPORT_TYPES}
     rows = []
 
     for report in reports:
         if report.report_type in counts:
             counts[report.report_type] += 1
         try:
-            resolved = active_storage.resolve(report.id)
+            resolved = (active_storage.resolve_record(report) if isinstance(active_storage, SupabaseReportStorage)
+                        else active_storage.resolve(report.id))
         except Exception:
             resolved = None
         readable = resolved is not None
@@ -2611,6 +2882,7 @@ def build_data_status(storage: Any | None = None) -> dict[str, Any]:
                 "original_name": report.original_name,
                 "size": report.size,
                 "readable": readable,
+                "source": 'Этот компьютер' if report.storage_path == 'local-supplement' else active_storage.storage_label(),
                 "status": "доступен" if readable else "ошибка чтения",
             }
         )
@@ -2649,7 +2921,7 @@ def render_data_status_block(status: dict[str, Any]) -> str:
         "<tr>"
         f"<td>{escape(str(item['type_label']))}</td>"
         f"<td>{escape(str(item['period']))}</td>"
-        f"<td>{escape(str(item['original_name']))}</td>"
+        f"<td>{escape(str(item['original_name']))}<br><small>{escape(str(item.get('source', '')))}</small></td>"
         f"<td>{escape(str(item['status']))}</td>"
         "</tr>"
         for item in status["reports"]
@@ -2661,7 +2933,7 @@ def render_data_status_block(status: dict[str, Any]) -> str:
 <section>
   <h2>Используется в расчете</h2>
   <p class="{ready_class}">{escape(str(status["summary"]))}</p>
-  <p class="muted">Хранилище: {escape(str(status["storage"]))}. Продажи: {sales_count}. Списания: {waste_count}.</p>
+  <p class="muted">Хранилище: {escape(str(status["storage"]))}. Продажи: {sales_count}. Списания: {waste_count}. Чеки: {_count_label(int(status["counts"].get("receipts", 0)))}.</p>
   <table><thead><tr><th>Тип</th><th>Период</th><th>Файл</th><th>Статус</th></tr></thead><tbody>{rows}</tbody></table>
 </section>"""
 
@@ -2720,7 +2992,7 @@ def render_reports_html(message: str = "", error: str = "") -> str:
     ) or "<tr><td colspan='5'>Загруженных отчетов пока нет.</td></tr>"
     notice = f"<p class='ok'>{escape(message)}</p>" if message else ""
     failure = f"<p class='error'>{escape(error)}</p>" if error else ""
-    storage_info = f"<p class='muted'>Хранилище: {escape(REPORT_STORAGE.storage_label())}</p>"
+    storage_info = f"<p class='muted'>Хранилище: {escape(REPORT_STORAGE.storage_label())}. Чеки и подробные акты хранятся на этом компьютере (AppData), пока не настроена миграция облачной базы.</p>"
     notice = storage_info + notice + render_data_status_block(build_data_status())
     return f"""<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2730,7 +3002,7 @@ section{{background:white;border-radius:14px;padding:22px;margin:18px 0;box-shad
 input,select,button{{font:inherit;padding:10px}}button{{background:#176b55;color:white;border:0;border-radius:8px;cursor:pointer}}table{{width:100%;border-collapse:collapse}}th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:left}}.ok{{color:#176b55}}.error{{color:#b42318}}.muted{{color:#607069}}a{{color:#176b55}}
 </style></head><body><main><p><a href="/">← К прогнозу</a></p><h1>Ежемесячная отчетность</h1>
 {notice}{failure}<section><h2>Загрузить файл</h2><form method="post" action="/reports/upload" enctype="multipart/form-data">
-<label for="report_type">Тип отчета</label><select id="report_type" name="report_type"><option value="sales">Продажи</option><option value="waste">Списания</option></select>
+<label for="report_type">Тип отчета</label><select id="report_type" name="report_type"><option value="sales">Продажи</option><option value="waste">Списания</option><option value="receipts">Чеки / поток гостей</option></select>
 <label for="file">Файл XLSX</label><input id="file" name="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple required>
 <p><button type="submit">Загрузить отчеты</button></p></form><p>До {MAX_BATCH_FILES} файлов за один раз, не более {MAX_BATCH_UPLOAD_MB} МБ суммарно и 10 МБ на файл. Можно выбрать ежедневные отчеты сразу за месяц. Каждый файл проверяется отдельно; ошибки не отменяют успешно загруженные файлы. Период определяется по датам внутри книги.</p></section>
 <section><h2>Архив файлов</h2><table><thead><tr><th>Тип</th><th>Период</th><th>Файл</th><th>Размер</th><th></th></tr></thead><tbody>{rows}</tbody></table></section>
@@ -2946,36 +3218,21 @@ def _render_menu_row(item: Any) -> str:
 
 def _render_menu_coverage_block(coverage: dict[str, Any]) -> str:
     if not coverage:
-        return ""
-    outside = coverage.get("outside_menu", {"items": 0, "quantity": 0, "rows": []})
-    disabled = coverage.get("disabled", {"items": 0, "quantity": 0, "rows": []})
-    own = coverage.get("own_production", {"items": 0, "quantity": 0, "rows": []})
-    in_menu = coverage.get("in_menu", {"items": 0, "quantity": 0, "rows": []})
-    outside_rows = _render_menu_coverage_rows(outside.get("rows", []), empty="Вне меню позиций не найдено.")
-    disabled_rows = _render_menu_coverage_rows(disabled.get("rows", []), empty="Отключенных позиций с продажами не найдено.")
-    own_rows = _render_menu_coverage_rows(own.get("rows", []), empty="Собственных позиций с продажами не найдено.")
-    return f"""
-      <div class="menu-coverage">
-        <div class="coverage-summary four">
-          <div><span>В поставку</span><strong>{in_menu.get("items", 0)} поз. / {in_menu.get("quantity", 0)} шт.</strong></div>
-          <div><span>Собственное</span><strong>{own.get("items", 0)} поз. / {own.get("quantity", 0)} шт.</strong></div>
-          <div><span>Вне меню</span><strong>{outside.get("items", 0)} поз. / {outside.get("quantity", 0)} шт.</strong></div>
-          <div><span>Исключено</span><strong>{disabled.get("items", 0)} поз. / {disabled.get("quantity", 0)} шт.</strong></div>
-        </div>
-        <details {"open" if int(own.get("items", 0)) else ""}>
-          <summary>Собственная продукция: попадает в план производства, но не в поставку</summary>
-          <table class="mini-table"><thead><tr><th>Позиция</th><th>Категория</th><th>Продажи</th><th>Причина</th></tr></thead><tbody>{own_rows}</tbody></table>
-        </details>
-        <details {"open" if int(outside.get("items", 0)) else ""}>
-          <summary>Позиции вне меню, которые могут объяснять расхождение</summary>
-          <table class="mini-table"><thead><tr><th>Позиция</th><th>Категория</th><th>Продажи</th><th>Причина</th></tr></thead><tbody>{outside_rows}</tbody></table>
-        </details>
-        <details>
-          <summary>Исключенные позиции с продажами</summary>
-          <table class="mini-table"><thead><tr><th>Позиция</th><th>Категория</th><th>Продажи</th><th>Причина</th></tr></thead><tbody>{disabled_rows}</tbody></table>
-        </details>
-      </div>
-    """
+        return ''
+    groups = [('in_menu', 'Сопоставлено с поставляемым меню'),
+              ('own_production', 'Кулинария ТТ'), ('outside_menu', 'Вне рабочего меню'),
+              ('disabled', 'Выключено в меню')]
+    summary = ''.join(f"<div><span>{label}</span><strong>{coverage.get(key, {}).get('items', 0)} поз. / {coverage.get(key, {}).get('quantity', 0)} шт.</strong></div>"
+                      for key,label in groups)
+    detail = ''.join(f"<details><summary>{label}: исторические продажи</summary><table class='mini-table'>"
+                     "<thead><tr><th>Позиция</th><th>Категория</th><th>Продано</th><th>Сопоставление</th></tr></thead>"
+                     f"<tbody>{_render_menu_coverage_rows(coverage[key]['rows'], empty='Нет строк.')}</tbody></table></details>"
+                     for key,label in groups if coverage.get(key, {}).get('items'))
+    return f"""<section id="reconciliation"><h2>Историческая сверка продаж и меню</h2>
+    <p>{coverage.get('period_start', '')}—{coverage.get('period_end', '')}. Это продажи за весь указанный период,
+    а не ближайший заказ и не остаток. «Вне рабочего меню» — ранее проданные блюда, не включенные в текущую поставку.
+    Кофе, выпечка, упаковка и снеки исключены. В подробностях показаны первые 12 позиций каждой группы.</p>
+    <div class="coverage-summary four">{summary}</div>{detail}</section>"""
 
 
 def render_menu_html(items: list[Any], message: str = "", error: str = "") -> str:
@@ -3110,11 +3367,13 @@ def run_server() -> None:
 
 def _payload_from_query(query: str) -> dict[str, Any]:
     params = parse_qs(query)
-    start_raw = params.get("start", [date.today().isoformat()])[0]
+    start_raw = params.get("start", [None])[0]
     days_raw = params.get("days", ["14"])[0]
     return build_dashboard_payload(
-        start_day=date.fromisoformat(start_raw),
+        start_day=date.fromisoformat(start_raw) if start_raw else None,
         horizon_days=int(days_raw),
+        service_level=float(params.get('service', ['85'])[0]) / 100,
+        profit_tolerance=float(params.get('reserve_cost', ['5'])[0]) / 100,
     )
 
 

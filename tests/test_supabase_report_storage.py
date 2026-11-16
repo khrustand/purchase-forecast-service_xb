@@ -13,6 +13,13 @@ from src.infrastructure.report_storage import (
 
 
 class ReportStorageBackendTests(TestCase):
+    def setUp(self):
+        from tests.synthetic_sales import sales_workbook_bytes
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.sales_fixture = Path(directory.name) / 'sales.xlsx'
+        self.sales_fixture.write_bytes(sales_workbook_bytes())
+
     def test_cached_file_is_not_used_after_report_row_is_deleted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             report_id = 'a' * 32
@@ -40,7 +47,7 @@ class ReportStorageBackendTests(TestCase):
                 create_report_storage()
 
     def test_supabase_storage_saves_metadata_and_downloads_file(self) -> None:
-        source = Path("data/local/culinary_sales_june_july.xlsx")
+        source = self.sales_fixture
         if not source.exists():
             self.skipTest("Локальная тестовая книга отсутствует")
         calls: list[tuple[str, str, bytes | None]] = []
@@ -85,7 +92,7 @@ class ReportStorageBackendTests(TestCase):
         self.assertTrue(any(call[0] == "POST" and "/storage/v1/object/uploads/" in call[1] for call in calls))
 
     def test_supabase_storage_falls_back_to_database_chunks_when_storage_upload_fails(self) -> None:
-        source = Path("data/local/culinary_sales_june_july.xlsx")
+        source = self.sales_fixture
         if not source.exists():
             self.skipTest("Локальная тестовая книга отсутствует")
         saved_payloads: list[dict[str, object]] = []
@@ -148,7 +155,7 @@ class ReportStorageBackendTests(TestCase):
         self.assertLessEqual(max(chunk_payload_sizes), 7000)
 
     def test_supabase_storage_removes_report_when_chunk_upload_fails(self) -> None:
-        source = Path("data/local/culinary_sales_june_july.xlsx")
+        source = self.sales_fixture
         if not source.exists():
             self.skipTest("Р›РѕРєР°Р»СЊРЅР°СЏ С‚РµСЃС‚РѕРІР°СЏ РєРЅРёРіР° РѕС‚СЃСѓС‚СЃС‚РІСѓРµС‚")
         saved_payloads: list[dict[str, object]] = []
@@ -242,7 +249,7 @@ class ReportStorageBackendTests(TestCase):
         self.assertEqual(len(chunk_urls), len(chunks) + 1)
 
     def test_supabase_resolve_redownloads_cached_file_with_wrong_size(self) -> None:
-        source = Path("data/local/culinary_sales_june_july.xlsx")
+        source = self.sales_fixture
         if not source.exists():
             self.skipTest("Локальная тестовая книга отсутствует")
         original_bytes = source.read_bytes()

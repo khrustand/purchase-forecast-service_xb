@@ -18,7 +18,9 @@ class MenuPageTests(TestCase):
                 disabled={"суп лапша куриный 0,300"}
             ),
         ):
-            payload = web_server.build_culinary_strategy_payload(reference_day=date(2026, 8, 4))
+            from tests.synthetic_sales import dashboard_fixture
+            with dashboard_fixture(web_server):
+                payload = web_server.build_culinary_strategy_payload(reference_day=date(2026, 8, 4))
 
         self.assertIsNotNone(payload)
         assert payload is not None
@@ -55,7 +57,9 @@ class MenuPageTests(TestCase):
         from src.app.web_server import save_menu_order_upload
 
         with TemporaryDirectory() as directory:
-            saved = save_menu_order_upload("Заказ №1.xlsx", b"xlsx-content", Path(directory))
+            with patch('src.domain.menu_catalog.read_culinary_order_sheet', return_value=[
+                ['Артикул', 'Товар'], ['123', 'Суп тестовый']]):
+                saved = save_menu_order_upload("Заказ №1.xlsx", b"xlsx-content", Path(directory))
 
             self.assertEqual(saved.name, "Заказ _1.xlsx")
             self.assertEqual(saved.read_bytes(), b"xlsx-content")

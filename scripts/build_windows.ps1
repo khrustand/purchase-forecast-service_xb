@@ -1,5 +1,6 @@
 param(
-    [switch]$InstallPyInstaller
+    [switch]$InstallPyInstaller,
+    [switch]$IncludeLocalOrderHistory
 )
 
 $ErrorActionPreference = "Stop"
@@ -8,6 +9,7 @@ $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $projectRoot
 
 $pythonCandidates = @(
+    (Join-Path $projectRoot ".venv\Scripts\python.exe"),
     (Join-Path $env:LOCALAPPDATA "Python\pythoncore-3.14-64\python.exe"),
     (Join-Path $env:LOCALAPPDATA "Programs\Python\Python314\python.exe"),
     (Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\python.exe"),
@@ -53,7 +55,14 @@ $pyInstallerArgs = @(
 )
 
 $previousOrdersDir = "Прошлые заказы"
-if (Test-Path -LiteralPath $previousOrdersDir) {
+# Python из runtime Codex использует дополнительный публичный файл сертификатов.
+# Его нужно переносить вместе с ssl.py; проверку TLS не отключаем.
+$sslResourcePath = & $PythonExe -c "import pathlib, ssl; print(pathlib.Path(ssl.__file__).with_name('codex-rejected-cas.pem'))"
+if (Test-Path -LiteralPath $sslResourcePath) {
+    $pyInstallerArgs += @("--add-data", "$sslResourcePath;.")
+}
+
+if ($IncludeLocalOrderHistory -and (Test-Path -LiteralPath $previousOrdersDir)) {
     $pyInstallerArgs += @("--add-data", "$previousOrdersDir;$previousOrdersDir")
 }
 

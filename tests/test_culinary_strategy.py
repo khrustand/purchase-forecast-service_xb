@@ -52,7 +52,7 @@ class CulinaryStrategyTests(TestCase):
             ]
         )
 
-        self.assertEqual(summary["target_total"], 34)
+        self.assertEqual(summary["target_total"], 32)
         self.assertEqual(summary["actual_total"], 1)
-        self.assertEqual(summary["shortfall"], 33)
+        self.assertEqual(summary["shortfall"], 31)
         self.assertEqual(summary["high_risk_count"], 1)

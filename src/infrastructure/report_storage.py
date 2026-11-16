@@ -6,7 +6,7 @@ import re
 import threading
 import uuid
 import base64
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,9 +16,10 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from scripts.analyze_culinary_strategy import daily_sales_period, excel_date, read_xlsx
+from src.infrastructure.report_formats import is_receipts, receipt_days, is_detailed_waste, waste_lines, waste_document
 
 
-ALLOWED_REPORT_TYPES = {"sales": "Продажи", "waste": "Списания"}
+ALLOWED_REPORT_TYPES = {"sales": "Продажи", "waste": "Списания", "receipts": "Чеки / поток гостей"}
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 CHUNK_BYTES = 4 * 1024
 CHUNK_PAGE_SIZE = 1
@@ -63,9 +64,16 @@ class MonthlyReportStorage:
         path.write_bytes(content)
         try:
             period_start, period_end = detect_period(path, report_type)
+            document = waste_document(read_xlsx(path)) if report_type == "waste" else ""
         except Exception as error:
             path.unlink(missing_ok=True)
             raise ReportValidationError(f"Не удалось прочитать период отчета: {error}") from error
+
+        if document:
+            stored_name = f"waste-doc-{document}-{report_id}.xlsx"
+            renamed = self.root / stored_name
+            path.rename(renamed)
+            path = renamed
 
         report = MonthlyReport(
             id=report_id,
@@ -83,9 +91,7 @@ class MonthlyReportStorage:
                 (
                     item
                     for item in reports
-                    if item.get("report_type") == report_type
-                    and item.get("period_start") == report.period_start
-                    and item.get("period_end") == report.period_end
+                    if same_report(item, report_type, report.period_start, report.period_end, document)
                 ),
                 None,
             )
@@ -140,6 +146,7 @@ class SupabaseReportStorage:
         bucket: str = "uploads",
         cache_root: Path | None = None,
         request: HttpRequest | None = None,
+        supplements: MonthlyReportStorage | None = None,
     ) -> None:
         self.url = url.rstrip("/")
         self.service_role_key = service_role_key
@@ -147,29 +154,38 @@ class SupabaseReportStorage:
         self.cache_root = cache_root or Path(os.getenv("REPORT_UPLOAD_DIR", "data/uploads")) / "supabase-cache"
         self.request = request or _default_request
         self.unavailable_reports: dict[str, str] = {}
+        self.supplements = supplements
 
     def list(self) -> list[MonthlyReport]:
         payload = self._select_reports()
         reports = [MonthlyReport(**item) for item in payload]
+        if self.supplements:
+            reports += [replace(item, storage_path='local-supplement') for item in self.supplements.list()]
+        active = {item.id for item in reports}
+        self.unavailable_reports = {key: value for key,value in self.unavailable_reports.items() if key in active}
         return sorted(reports, key=lambda item: (item.period_start, item.uploaded_at), reverse=True)
 
     def save(self, report_type: str, original_name: str, content: bytes) -> MonthlyReport:
         validate_report_content(report_type, original_name, content)
+        if report_type == 'receipts' and self.supplements:
+            return self.supplements.save(report_type, original_name, content)
         with TemporaryDirectory() as directory:
             temporary_path = Path(directory) / safe_display_name(original_name)
             temporary_path.write_bytes(content)
             try:
                 period_start, period_end = detect_period(temporary_path, report_type)
+                document = waste_document(read_xlsx(temporary_path)) if report_type == "waste" else ""
             except Exception as error:
                 raise ReportValidationError(f"Не удалось прочитать период отчета: {error}") from error
+
+        if document and self.supplements:
+            return self.supplements.save(report_type, original_name, content)
 
         duplicate = next(
             (
                 item
                 for item in self.list()
-                if item.report_type == report_type
-                and item.period_start == period_start.isoformat()
-                and item.period_end == period_end.isoformat()
+                if same_report(asdict(item), report_type, period_start.isoformat(), period_end.isoformat(), document)
             ),
             None,
         )
@@ -178,6 +194,8 @@ class SupabaseReportStorage:
 
         report_id = uuid.uuid4().hex
         stored_name = f"{report_type}-{report_id}.xlsx"
+        if document:
+            stored_name = f"waste-doc-{document}-{report_id}.xlsx"
         storage_path = f"reports/{report_type}/{period_start.isoformat()}_{period_end.isoformat()}/{stored_name}"
         try:
             self._upload_object(storage_path, content)
@@ -218,9 +236,18 @@ class SupabaseReportStorage:
     def resolve(self, report_id: str) -> tuple[MonthlyReport, Path] | None:
         if not re.fullmatch(r"[a-f0-9]{32}", report_id):
             return None
+        if self.supplements:
+            local = self.supplements.resolve(report_id)
+            if local is not None:
+                return replace(local[0], storage_path='local-supplement'), local[1]
         report = next((item for item in self.list() if item.id == report_id), None)
         if report is None:
             return None
+        return self.resolve_record(report)
+
+    def resolve_record(self, report: MonthlyReport) -> tuple[MonthlyReport, Path] | None:
+        if report.storage_path == 'local-supplement' and self.supplements:
+            return self.supplements.resolve(report.id)
         path = self.cache_root / report.stored_name
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists() or path.stat().st_size != report.size:
@@ -239,7 +266,7 @@ class SupabaseReportStorage:
                 continue
             self.unavailable_reports.pop(item.id, None)
             try:
-                resolved = self.resolve(item.id)
+                resolved = self.resolve_record(item)
             except ReportValidationError:
                 self.unavailable_reports[item.id] = item.original_name
                 continue
@@ -409,7 +436,9 @@ def create_report_storage() -> MonthlyReportStorage | SupabaseReportStorage:
     bucket = os.getenv("SUPABASE_STORAGE_BUCKET", "uploads").strip() or "uploads"
     if not url or not service_role_key:
         raise ReportValidationError("Для Supabase-хранилища нужны SUPABASE_URL и SUPABASE_SERVICE_ROLE_KEY.")
-    return SupabaseReportStorage(url=url, service_role_key=service_role_key, bucket=bucket)
+    local_root = Path(os.getenv('LOCALAPPDATA', str(Path.home()))) / 'PurchaseForecastService' / 'supplemental-reports'
+    return SupabaseReportStorage(url=url, service_role_key=service_role_key, bucket=bucket,
+                                 supplements=MonthlyReportStorage(local_root))
 
 
 def validate_report_content(report_type: str, original_name: str, content: bytes) -> None:
@@ -427,6 +456,20 @@ def validate_report_content(report_type: str, original_name: str, content: bytes
 
 def detect_period(path: Path, report_type: str) -> tuple[date, date]:
     rows = read_xlsx(path)
+    if is_receipts(rows):
+        if report_type != "receipts":
+            raise ValueError("Это отчет по чекам. Выберите тип «Чеки / поток гостей».")
+        days = receipt_days(rows)
+        if not days:
+            raise ValueError("в отчете чеков не найдены даты")
+        return min(r.day for r in days), max(r.day for r in days)
+    if report_type == "receipts":
+        raise ValueError("не найден заголовок отчета по чекам")
+    if report_type == "waste" and is_detailed_waste(rows):
+        lines = waste_lines(rows)
+        if not lines:
+            raise ValueError("акт списания не содержит товарных строк")
+        return min(r.day for r in lines), max(r.day for r in lines)
     if report_type == "sales":
         daily_period = daily_sales_period(rows)
         if daily_period is not None:
@@ -466,3 +509,12 @@ def _default_request(method: str, url: str, headers: dict[str, str], data: bytes
 
 def _quote_path(value: str) -> str:
     return "/".join(quote(part, safe="") for part in value.split("/"))
+
+
+def same_report(item: dict, report_type: str, start: str, end: str, document: str) -> bool:
+    if item.get("report_type") != report_type or item.get("period_start") != start or item.get("period_end") != end:
+        return False
+    stored = str(item.get("stored_name", ""))
+    if document:
+        return stored.startswith(f"waste-doc-{document}-")
+    return not stored.startswith("waste-doc-")

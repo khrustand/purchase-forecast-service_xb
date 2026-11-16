@@ -22,6 +22,10 @@
 - `.codex/starter/AGENTS.md`
 - `.codex/project/project-context.md`
 
+Если эти локальные файлы отсутствуют после клонирования, использовать
+`docs/developer-handoff.md`. Полный локальный контекст доступен в отдельном
+приватном снимке данных; он не публикуется в Git.
+
 Для ролевых задач использовать prompts из:
 
 - `.codex/starter/prompts/`

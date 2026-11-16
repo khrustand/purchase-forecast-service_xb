@@ -39,6 +39,10 @@ data/uploads/
 data/docker-volume-export/
 data/menu/
 Прошлые заказы/
+private-data/
+handoff-data/
+*Handoff*.zip
+*handoff*.zip
 
 # Editors and OS
 .codex/

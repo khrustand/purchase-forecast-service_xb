@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zipfile import ZipFile
+from src.infrastructure.report_formats import is_detailed_waste, waste_lines
 
 
 MAIN_NS = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
@@ -103,7 +104,7 @@ def main() -> int:
             "оцениваем стабильность: сколько дней позиция реально продавалась и насколько скачет спрос",
             "делим позиции на A/B/C по доле продаж и стабильности",
             "штрафуем позиции с частыми списаниями и слабым спросом",
-            "собираем дневную ротацию из 34 позиций: 8 супов, 9 вторых, 17 завтраков и салатов",
+            "подбираем до 32 поставляемых позиций по истории спроса; финансовое ранжирование доступно в веб-аналитике",
             "в основную витрину сначала ставим позиции без высокого риска списаний, высокорисковые берем только как вынужденную подмену",
             "для заказа на N дней берем среднедневной спрос, добавляем запас по классу и уменьшаем запас при риске списаний",
             "остатки пока не вычитаются, потому что их нет в выгрузке продаж",
@@ -332,7 +333,8 @@ def strategy_for(abc_class: str, stability: str, order: int, waste_risk: str) ->
     return "не заказывать без ручной причины"
 
 
-def build_daily_menu(recommendations: list[dict[str, object]]) -> list[dict[str, object]]:
+def build_daily_menu(recommendations: list[dict[str, object]], *, ranked: bool = False,
+                     capacity: int = 32) -> list[dict[str, object]]:
     selected: list[dict[str, object]] = []
     by_category: dict[str, list[dict[str, object]]] = {}
     for item in recommendations:
@@ -356,6 +358,11 @@ def build_daily_menu(recommendations: list[dict[str, object]]) -> list[dict[str,
         for item in by_category.get(category, [])
     ]
     selected.extend(select_for_menu(flex_items, FLEX_MENU_TARGET))
+
+    if ranked:
+        selected = recommendations[:capacity]
+    else:
+        selected = selected[:capacity]
 
     return sorted(
         [
@@ -387,8 +394,7 @@ def menu_role_for(item: dict[str, object]) -> str:
     return "основная витрина"
 
 
-def daily_menu_summary(daily_menu: list[dict[str, object]]) -> dict[str, object]:
-    target_total = sum(DAILY_MENU_QUOTAS.values()) + FLEX_MENU_TARGET
+def daily_menu_summary(daily_menu: list[dict[str, object]], target_total: int = 32) -> dict[str, object]:
     high_risk_count = sum(1 for item in daily_menu if str(item["waste_risk"]) == HIGH_WASTE_RISK)
     by_category: dict[str, int] = {}
     for item in daily_menu:
@@ -569,7 +575,7 @@ def render_markdown(payload: dict[str, object]) -> str:
             "",
             "## Ротация меню на день",
             "",
-            "Цель: 34 позиции в день: 8 супов, 9 вторых, 17 завтраков и салатов.",
+            "Цель: до 32 поставляемых позиций; кулинария ТТ учитывается отдельно в веб-панели.",
             "",
         ]
     )
@@ -642,8 +648,17 @@ def extract_waste_counts(
     rows = read_xlsx(path)
     names = {normalize_name(item.name): item.name for item in items}
     counts = {normalized: 0 for normalized in names}
+    if is_detailed_waste(rows):
+        for line in waste_lines(rows):
+            if not line.staff and start <= line.day <= end:
+                name = normalize_name(line.name)
+                if name in counts:
+                    counts[name] += 1
+        return counts
     for row in rows[4:]:
         if len(row) < 4:
+            continue
+        if len(row) > 10 and any(word in str(row[10]).casefold() for word in ('сотрудник', 'персонал')):
             continue
         day = parse_datetime(row[0])
         if day is None or not (start <= day <= end):
