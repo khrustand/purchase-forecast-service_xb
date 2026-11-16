@@ -125,7 +125,7 @@ class WindowsLauncherTests(TestCase):
     def test_find_edge_executable_checks_standard_install_paths(self) -> None:
         from src.app.windows_launcher import find_edge_executable
 
-        expected = Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
+        expected = Path(r"C:\Program Files (x86)") / 'Microsoft' / 'Edge' / 'Application' / 'msedge.exe'
 
         result = find_edge_executable(
             exists=lambda path: path == expected,
