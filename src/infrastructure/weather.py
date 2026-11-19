@@ -39,22 +39,31 @@ class WeatherForecast:
 
 
 def load_met_norway_forecast() -> WeatherForecast | None:
-    if os.getenv("WEATHER_PROVIDER", "off").lower() != "met-no":
+    if os.getenv("WEATHER_PROVIDER", "met-no").lower() != "met-no":
         return None
     cache_path = Path(os.getenv("WEATHER_CACHE_PATH", "data/uploads/met_norway_forecast.json"))
     ttl_minutes = int(os.getenv("WEATHER_CACHE_TTL_MINUTES", "180"))
     cached = _read_cache(cache_path)
-    if cached and _cache_is_fresh(cached, ttl_minutes):
-        return parse_forecast_payload(cached["payload"])
+    cached_forecast = None
+    if cached:
+        try:
+            cached_forecast = parse_forecast_payload(cached['payload'])
+        except (ValueError, TypeError, KeyError):
+            cached = None
+    if cached and cached_forecast and _cache_is_fresh(cached, ttl_minutes):
+        return cached_forecast
 
     try:
         payload = _fetch_payload()
-        _write_cache(cache_path, payload)
-        return parse_forecast_payload(payload)
+        forecast = parse_forecast_payload(payload)
+        try:
+            _write_cache(cache_path, payload)
+        except OSError:
+            pass  # Рабочий сетевой прогноз используем и без записи кэша.
+        return forecast
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
-        if cached:
-            forecast = parse_forecast_payload(cached["payload"])
-            return WeatherForecast(forecast.days, forecast.source, forecast.updated_at, stale=True)
+        if cached_forecast:
+            return WeatherForecast(cached_forecast.days, cached_forecast.source, cached_forecast.updated_at, stale=True)
         return None
 
 
@@ -129,8 +138,12 @@ def _read_cache(path: Path) -> dict[str, Any] | None:
 
 
 def _cache_is_fresh(cache: dict[str, Any], ttl_minutes: int) -> bool:
-    fetched_at = datetime.fromisoformat(str(cache["fetched_at"]))
-    return datetime.now(timezone.utc) - fetched_at < timedelta(minutes=ttl_minutes)
+    try:
+        fetched_at = datetime.fromisoformat(str(cache["fetched_at"]))
+        age = datetime.now(timezone.utc) - fetched_at
+        return timedelta(0) <= age < timedelta(minutes=ttl_minutes)
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def _write_cache(path: Path, payload: dict[str, Any]) -> None:

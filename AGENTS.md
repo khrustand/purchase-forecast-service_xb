@@ -22,6 +22,10 @@
 - `.codex/starter/AGENTS.md`
 - `.codex/project/project-context.md`
 
+Если эти локальные файлы отсутствуют после клонирования, использовать
+`docs/developer-handoff.md`. Полный локальный контекст доступен в отдельном
+приватном снимке данных; он не публикуется в Git.
+
 Для ролевых задач использовать prompts из:
 
 - `.codex/starter/prompts/`
@@ -32,17 +36,18 @@
 
 ### Стек проекта
 
-- Frontend: TBD
-- Backend / CLI: TBD
-- Mobile: TBD
-- Database: TBD
-- Infrastructure: TBD
+- Frontend: HTML/CSS/JavaScript, шаблоны в Python HTTP-сервере.
+- Backend / CLI: Python >=3.11, стандартная библиотека, без внешних зависимостей.
+- Mobile: Android, Kotlin, Jetpack Compose, JDK 17, SDK 35.
+- Database: локальные JSON/CSV/XLSX либо Supabase Postgres и Storage.
+- Infrastructure: локальный Python, Docker Compose, Render; Windows exe через PyInstaller.
 
 ### Команды запуска, тестирования и сборки
 
-- `TBD` - запустить приложение локально.
-- `TBD` - запустить тесты.
-- `TBD` - собрать production artifact.
+- `.\.venv\Scripts\python.exe -m scripts.run_local` - запустить веб-панель с `.env`.
+- `.\.venv\Scripts\python.exe -m unittest` - запустить тесты.
+- `docker compose up --build` - собрать и запустить контейнер.
+- `powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1 -InstallPyInstaller` - собрать Windows exe (нужен доступный скрипту системный Python).
 
 ### Архитектурные ограничения
 

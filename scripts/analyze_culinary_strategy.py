@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zipfile import ZipFile
+from src.infrastructure.report_formats import is_detailed_waste, waste_lines
 
 
 MAIN_NS = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
@@ -28,7 +29,7 @@ DAILY_MENU_QUOTAS = {
     "Супы": 8,
     "Горячее": 9,
 }
-FLEX_MENU_CATEGORIES = {"Завтраки", "Салаты"}
+FLEX_MENU_CATEGORIES = {"Завтраки", "Салаты", "Роллы"}
 FLEX_MENU_TARGET = 17
 HIGH_WASTE_RISK = "высокий риск списаний"
 
@@ -103,7 +104,7 @@ def main() -> int:
             "оцениваем стабильность: сколько дней позиция реально продавалась и насколько скачет спрос",
             "делим позиции на A/B/C по доле продаж и стабильности",
             "штрафуем позиции с частыми списаниями и слабым спросом",
-            "собираем дневную ротацию из 34 позиций: 8 супов, 9 вторых, 17 завтраков и салатов",
+            "подбираем до 32 поставляемых позиций по истории спроса; финансовое ранжирование доступно в веб-аналитике",
             "в основную витрину сначала ставим позиции без высокого риска списаний, высокорисковые берем только как вынужденную подмену",
             "для заказа на N дней берем среднедневной спрос, добавляем запас по классу и уменьшаем запас при риске списаний",
             "остатки пока не вычитаются, потому что их нет в выгрузке продаж",
@@ -118,6 +119,22 @@ def main() -> int:
 
 
 def extract_items(rows: list[list[str | None]], start: date, end: date) -> list[DailySalesItem]:
+    daily_period = daily_sales_period(rows)
+    if daily_period is not None:
+        day = daily_period[0]
+        if not start <= day <= end:
+            return []
+        items = []
+        for row in rows[4:]:
+            if len(row) < 5:
+                continue
+            category, name = clean(row[0]), clean(row[1])
+            if not category or not name or name.lower().startswith(('итого', 'всего')):
+                continue
+            quantity = sales_quantity(row[4])
+            if quantity is not None and quantity >= 0 and category not in EXCLUDED_CATEGORIES:
+                items.append(DailySalesItem(category, name, {day: quantity}))
+        return items
     header = rows[5]
     date_columns = [
         (index, parsed)
@@ -141,15 +158,31 @@ def extract_items(rows: list[list[str | None]], start: date, end: date) -> list[
             continue
 
         by_date = {
-            day: number(row[index])
+            day: quantity
             for index, day in date_columns
-            if index < len(row) and row[index] is not None and str(row[index]).strip() != ""
+            if index < len(row) and (quantity := sales_quantity(row[index])) is not None
         }
-        if sum(by_date.values()) <= 0:
+        if not by_date or sum(by_date.values()) < 0:
             continue
         items.append(DailySalesItem(current_category, name, by_date))
 
     return items
+
+
+def daily_sales_period(rows: list[list[str | None]]) -> tuple[date, date] | None:
+    """Распознать суточный отчет с количеством и выручкой вместо колонок дат."""
+    if len(rows) < 4 or rows[3][:2] != ['Категория', 'Элемент номенклатуры']:
+        return None
+    if len(rows[3]) < 5 or rows[3][4] != 'Количество':
+        return None
+    text = ' '.join(str(value or '') for row in rows[:3] for value in row)
+    match = re.search(r'За период:\s*с\s*(\d{2}\.\d{2}\.\d{4})\s*по\s*(\d{2}\.\d{2}\.\d{4})', text)
+    if not match:
+        raise ValueError('в суточном отчете не найден период')
+    start, end = (datetime.strptime(value, '%d.%m.%Y').date() for value in match.groups())
+    if start != end:
+        raise ValueError('сводный отчет за несколько дней не содержит разбивки продаж по датам')
+    return start, end
 
 
 def build_recommendations(
@@ -157,6 +190,8 @@ def build_recommendations(
     days: int,
     waste_counts: dict[str, int],
     shelf_life: dict[str, dict[str, object]] | None = None,
+    *,
+    include_low_volume: bool = False,
 ) -> list[dict[str, object]]:
     sorted_items = sorted(items, key=lambda item: item.total, reverse=True)
     total_sales = sum(item.total for item in sorted_items) or 1
@@ -183,6 +218,8 @@ def build_recommendations(
         effective_days = min(days, shelf_life_days)
         raw_order = item.average_per_day * effective_days * (1 + safety_rate)
         rounded_order = round_order(raw_order, item, abc_class)
+        if include_low_volume and not rounded_order:
+            rounded_order = math.ceil(raw_order)
         if rounded_order <= 0:
             continue
         recommendations.append(
@@ -300,7 +337,8 @@ def strategy_for(abc_class: str, stability: str, order: int, waste_risk: str) ->
     return "не заказывать без ручной причины"
 
 
-def build_daily_menu(recommendations: list[dict[str, object]]) -> list[dict[str, object]]:
+def build_daily_menu(recommendations: list[dict[str, object]], *, ranked: bool = False,
+                     capacity: int = 32) -> list[dict[str, object]]:
     selected: list[dict[str, object]] = []
     by_category: dict[str, list[dict[str, object]]] = {}
     for item in recommendations:
@@ -324,6 +362,11 @@ def build_daily_menu(recommendations: list[dict[str, object]]) -> list[dict[str,
         for item in by_category.get(category, [])
     ]
     selected.extend(select_for_menu(flex_items, FLEX_MENU_TARGET))
+
+    if ranked:
+        selected = recommendations[:capacity]
+    else:
+        selected = selected[:capacity]
 
     return sorted(
         [
@@ -355,8 +398,7 @@ def menu_role_for(item: dict[str, object]) -> str:
     return "основная витрина"
 
 
-def daily_menu_summary(daily_menu: list[dict[str, object]]) -> dict[str, object]:
-    target_total = sum(DAILY_MENU_QUOTAS.values()) + FLEX_MENU_TARGET
+def daily_menu_summary(daily_menu: list[dict[str, object]], target_total: int = 32) -> dict[str, object]:
     high_risk_count = sum(1 for item in daily_menu if str(item["waste_risk"]) == HIGH_WASTE_RISK)
     by_category: dict[str, int] = {}
     for item in daily_menu:
@@ -537,7 +579,7 @@ def render_markdown(payload: dict[str, object]) -> str:
             "",
             "## Ротация меню на день",
             "",
-            "Цель: 34 позиции в день: 8 супов, 9 вторых, 17 завтраков и салатов.",
+            "Цель: до 32 поставляемых позиций; кулинария ТТ учитывается отдельно в веб-панели.",
             "",
         ]
     )
@@ -610,8 +652,17 @@ def extract_waste_counts(
     rows = read_xlsx(path)
     names = {normalize_name(item.name): item.name for item in items}
     counts = {normalized: 0 for normalized in names}
+    if is_detailed_waste(rows):
+        for line in waste_lines(rows):
+            if not line.staff and start <= line.day <= end:
+                name = normalize_name(line.name)
+                if name in counts:
+                    counts[name] += 1
+        return counts
     for row in rows[4:]:
         if len(row) < 4:
+            continue
+        if len(row) > 10 and any(word in str(row[10]).casefold() for word in ('сотрудник', 'персонал')):
             continue
         day = parse_datetime(row[0])
         if day is None or not (start <= day <= end):
@@ -731,6 +782,14 @@ def number(value: str | None) -> float:
         return float(str(value).replace(",", "."))
     except ValueError:
         return 0
+
+
+def sales_quantity(value: str | None) -> float | None:
+    try:
+        quantity = float(re.sub(r"\s+", "", str(value)).replace(",", "."))
+    except ValueError:
+        return None
+    return quantity if math.isfinite(quantity) else None
 
 
 if __name__ == "__main__":

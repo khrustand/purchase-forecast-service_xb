@@ -12,6 +12,13 @@ from src.infrastructure.report_storage import (
 
 
 class MonthlyReportStorageTests(TestCase):
+    def setUp(self):
+        from tests.synthetic_sales import sales_workbook_bytes
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.sales_fixture = Path(directory.name) / 'sales.xlsx'
+        self.sales_fixture.write_bytes(sales_workbook_bytes())
+
     def test_rejects_non_xlsx_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             storage = MonthlyReportStorage(Path(directory))
@@ -27,7 +34,7 @@ class MonthlyReportStorageTests(TestCase):
                 storage.save("unknown", "report.xlsx", b"PK")
 
     def test_saves_sales_report_and_detects_period(self) -> None:
-        source = Path("data/local/culinary_sales_june_july.xlsx")
+        source = self.sales_fixture
         if not source.exists():
             self.skipTest("Локальная тестовая книга отсутствует")
         with tempfile.TemporaryDirectory() as directory:

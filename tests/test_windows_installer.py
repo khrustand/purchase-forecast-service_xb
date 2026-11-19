@@ -28,3 +28,11 @@ class WindowsInstallerTests(TestCase):
         self.assertIn("ISCC.exe", content)
         self.assertIn("installer\\purchase-forecast-service.iss", content)
         self.assertIn("PurchaseForecastServiceSetup.exe", content)
+
+    def test_windows_build_script_bundles_previous_orders_when_available(self) -> None:
+        script = Path("scripts/build_windows.ps1")
+
+        content = script.read_text(encoding="utf-8")
+
+        self.assertIn("Прошлые заказы", content)
+        self.assertIn("--add-data", content)
