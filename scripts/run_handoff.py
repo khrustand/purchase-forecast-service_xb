@@ -32,8 +32,7 @@ def main():
     os.chdir(root)
     from src.app import web_server as web
     web.DEFAULT_MENU_STATE_PATH = root / 'menu-state.json'
-    from http.server import ThreadingHTTPServer
-    server = ThreadingHTTPServer(('127.0.0.1', args.port), web.DashboardHandler)
+    server = web.DashboardServer(('127.0.0.1', args.port), web.DashboardHandler)
     print(f'Отдельная копия: http://127.0.0.1:{args.port}. Остановка: Ctrl+C.')
     try:
         server.serve_forever()

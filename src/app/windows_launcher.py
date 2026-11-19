@@ -81,9 +81,9 @@ def open_app_window_later(
 
 
 def create_app_server(port: int) -> ThreadingHTTPServer:
-    from src.app.web_server import DashboardHandler
+    from src.app.web_server import DashboardHandler, DashboardServer
 
-    return ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
+    return DashboardServer(("0.0.0.0", port), DashboardHandler)
 
 
 def run_app_server(server: ThreadingHTTPServer) -> None:

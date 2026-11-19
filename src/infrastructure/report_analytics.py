@@ -8,7 +8,7 @@ from pathlib import Path
 
 from scripts.analyze_culinary_strategy import read_xlsx, normalize_name, daily_sales_period
 from src.domain.culinary import is_culinary_category
-from src.infrastructure.report_formats import decimal_value, waste_lines, receipt_days
+from src.infrastructure.report_formats import decimal_value, waste_lines, receipt_days, text_date
 from src.domain.loss_budget import loss_group, GROUPS, allocate_loss_budget
 
 
@@ -143,13 +143,37 @@ def loss_group_totals(sales_paths: list[Path], waste_paths: list[Path], start: d
             products[product_key(str(row[1]))] = group
             if group:
                 totals[group]['revenue'] += decimal_value(row[6])
-    for line in read_detailed_waste(waste_paths):
+    detailed = read_detailed_waste(waste_paths)
+    documents = {(line.day, line.document) for line in detailed}
+    for line in detailed:
         if line.staff or not start <= line.day <= end:
             continue
         group = products.get(product_key(line.name)) or loss_group(line.account)
         if group:
             totals[group]['waste_cost'] += line.cost
             totals[group]['days'].add(line.day)
+    for path in waste_paths:
+        rows = read_xlsx(path)
+        header = next((i for i, row in enumerate(rows[:10])
+                       if {'Дата', '№  документа', 'Сумма, р.', 'Счет списания', 'Проведен'} <= set(row)), None)
+        if header is None:
+            continue
+        day_col, doc_col, cost_col, account_col, posted_col = (
+            rows[header].index(field) for field in ('Дата', '№  документа', 'Сумма, р.', 'Счет списания', 'Проведен')
+        )
+        for row in rows[header + 1:]:
+            if len(row) <= max(day_col, doc_col, cost_col, account_col, posted_col) or row[posted_col] != 'Да':
+                continue
+            day = text_date(row[day_col])
+            account = str(row[account_col] or '').casefold()
+            group = loss_group(account)
+            identity = (day, str(row[doc_col] or ''))
+            if (not day or not start <= day <= end or not identity[1] or identity in documents
+                    or not group or any(tag in account for tag in ('сотрудник', 'персонал'))):
+                continue
+            totals[group]['waste_cost'] += decimal_value(row[cost_col])
+            totals[group]['days'].add(day)
+            documents.add(identity)
     return {g: {'revenue': float(row['revenue']), 'waste_cost': float(row['waste_cost']),
                 'waste_days': len(row['days'])} for g,row in totals.items()}
 

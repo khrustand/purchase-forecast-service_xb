@@ -14,7 +14,7 @@ def loss_group(category: str) -> str | None:
         return 'bread'
     if any(tag in key for tag in ('кондитер', 'торт', 'песоч', 'мелкоштуч', 'пирожн')):
         return 'desserts'
-    if any(tag in key for tag in ('слоен', 'сдоб', 'выпеч')):
+    if any(tag in key for tag in ('слоен', 'слойк', 'сдоб', 'выпеч')):
         return 'bakery'
     return None
 

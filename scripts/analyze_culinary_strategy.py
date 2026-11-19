@@ -131,8 +131,8 @@ def extract_items(rows: list[list[str | None]], start: date, end: date) -> list[
             category, name = clean(row[0]), clean(row[1])
             if not category or not name or name.lower().startswith(('итого', 'всего')):
                 continue
-            quantity = number(row[4])
-            if quantity > 0 and category not in EXCLUDED_CATEGORIES:
+            quantity = sales_quantity(row[4])
+            if quantity is not None and quantity >= 0 and category not in EXCLUDED_CATEGORIES:
                 items.append(DailySalesItem(category, name, {day: quantity}))
         return items
     header = rows[5]
@@ -158,11 +158,11 @@ def extract_items(rows: list[list[str | None]], start: date, end: date) -> list[
             continue
 
         by_date = {
-            day: number(row[index])
+            day: quantity
             for index, day in date_columns
-            if index < len(row) and row[index] is not None and str(row[index]).strip() != ""
+            if index < len(row) and (quantity := sales_quantity(row[index])) is not None
         }
-        if sum(by_date.values()) <= 0:
+        if not by_date or sum(by_date.values()) < 0:
             continue
         items.append(DailySalesItem(current_category, name, by_date))
 
@@ -190,6 +190,8 @@ def build_recommendations(
     days: int,
     waste_counts: dict[str, int],
     shelf_life: dict[str, dict[str, object]] | None = None,
+    *,
+    include_low_volume: bool = False,
 ) -> list[dict[str, object]]:
     sorted_items = sorted(items, key=lambda item: item.total, reverse=True)
     total_sales = sum(item.total for item in sorted_items) or 1
@@ -216,6 +218,8 @@ def build_recommendations(
         effective_days = min(days, shelf_life_days)
         raw_order = item.average_per_day * effective_days * (1 + safety_rate)
         rounded_order = round_order(raw_order, item, abc_class)
+        if include_low_volume and not rounded_order:
+            rounded_order = math.ceil(raw_order)
         if rounded_order <= 0:
             continue
         recommendations.append(
@@ -778,6 +782,14 @@ def number(value: str | None) -> float:
         return float(str(value).replace(",", "."))
     except ValueError:
         return 0
+
+
+def sales_quantity(value: str | None) -> float | None:
+    try:
+        quantity = float(re.sub(r"\s+", "", str(value)).replace(",", "."))
+    except ValueError:
+        return None
+    return quantity if math.isfinite(quantity) else None
 
 
 if __name__ == "__main__":

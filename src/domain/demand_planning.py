@@ -67,7 +67,8 @@ def plan_demand(history: Mapping[date, float], days: Sequence[date], cutoff: dat
                 staff: Sequence[int], factors: Sequence[float], price: float | None = None,
                 cost: float | None = None, service_level: float = DEFAULT_SERVICE_LEVEL,
                 trial_quantity: int | None = None,
-                profit_tolerance: float = DEFAULT_PROFIT_TOLERANCE) -> dict:
+                profit_tolerance: float = DEFAULT_PROFIT_TOLERANCE,
+                *, guest_limit: int | None = None) -> dict:
     if not 0 < service_level < 1:
         raise ValueError('Уровень защиты спроса должен быть больше 0 и меньше 100%.')
     if not 0 <= profit_tolerance <= 1:
@@ -129,6 +130,9 @@ def plan_demand(history: Mapping[date, float], days: Sequence[date], cutoff: dat
                 guest = candidate
             else:
                 break
+    unconstrained = guest
+    if economic is not None and guest_limit is not None:
+        guest = max(economic, min(guest, guest_limit))
     results = outcomes(guest)
     daily_mean = [sum(sample[i] * w for sample, w in zip(samples, weights)) for i in range(len(days))]
     allocation = distribute_quantity(guest, daily_mean)
@@ -138,7 +142,8 @@ def plan_demand(history: Mapping[date, float], days: Sequence[date], cutoff: dat
             'economic_quantity': economic, 'service_quantity': service,
             'availability_cost': round(optimum_profit - results['expected_profit'], 2) if priced else None,
             'availability_cost_limit': round(cost_limit, 2) if priced else None,
-            'limited_by_profit': guest < service,
+            'limited_by_profit': unconstrained < service,
+            'category_reserve_removed': unconstrained - guest,
             'service_target_met': guest >= service,
             'alternatives': [{'policy': policy, 'quantity': q + sum(staff) if q is not None else None,
                               **{key: round(value, 4) if value is not None else None

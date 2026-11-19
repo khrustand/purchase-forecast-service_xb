@@ -19,7 +19,18 @@ from urllib.parse import parse_qs, urlparse
 
 from src.app.cli import load_purchase_items
 from src.app.analytics_views import render_loss_kpi, render_matrix, render_traffic
+from src.app.category_orders import check_category_reserves, render_category_reserves
+from src.app.loss_planning import monthly_loss_plan, render_monthly_loss_plan
+from src.infrastructure.loss_plans import loss_plan_path, save_loss_plan
 from src.app.demand_views import model_details, number, render_demand_method
+from src.app.order_exports import OrderExportStore, prepare_order_download
+from src.app.order_navigation import upcoming_order_dates, render_order_date_tabs
+from src.app.order_finance import (
+    finance_cells, finance_details, status_details, status_explanation, assortment_status,
+    order_totals, render_order_totals,
+)
+from src.app.order_interactions import ORDER_DETAILS_SCRIPT
+from src.infrastructure.order_workbook import MIME_TYPE as ORDER_WORKBOOK_MIME
 from src.domain.menu_catalog import (
     apply_menu_state,
     build_menu_catalog,
@@ -73,6 +84,7 @@ from src.domain.order_policy import (
     delivery_deadline,
 )
 from src.domain.traffic import traffic_adjustment, allocate_staff
+from src.domain.staff_meals import eligible_staff_demand
 
 
 DEFAULT_ITEMS_PATH = project_path("data/examples/purchase_items.json")
@@ -278,6 +290,7 @@ def build_dashboard_payload(
     now: datetime | None = None,
     service_level: float = DEFAULT_SERVICE_LEVEL,
     profit_tolerance: float = DEFAULT_PROFIT_TOLERANCE,
+    loss_month: date | None = None,
 ) -> dict[str, Any]:
     clock = now or moscow_now()
     clock = clock.replace(tzinfo=MOSCOW) if clock.tzinfo is None else clock.astimezone(MOSCOW)
@@ -291,6 +304,7 @@ def build_dashboard_payload(
     return {
         "generated_at": clock.date().isoformat(),
         "start_day": start.isoformat(),
+        "order_dates": upcoming_order_dates(clock),
         "horizon_days": horizon_days,
         "order_cycle_days": DEFAULT_ORDER_CYCLE_DAYS,
         "budget": _localize_budget(budget),
@@ -327,7 +341,7 @@ def build_dashboard_payload(
         ],
         "culinary_strategy": build_culinary_strategy_payload(
             reference_day=delivery_start - timedelta(days=1), production_start_day=start,
-            ordering_now=clock, service_level=service_level, profit_tolerance=profit_tolerance),
+            ordering_now=clock, service_level=service_level, profit_tolerance=profit_tolerance, loss_month=loss_month),
     }
 
 
@@ -343,6 +357,7 @@ def build_culinary_strategy_payload(
     ordering_now: datetime | None = None,
     service_level: float = DEFAULT_SERVICE_LEVEL,
     profit_tolerance: float = DEFAULT_PROFIT_TOLERANCE,
+    loss_month: date | None = None,
 ) -> dict[str, Any] | None:
     live_weather = load_met_norway_forecast()
     # Не оставляем предыдущий сетевой прогноз активным после отключения провайдера.
@@ -391,7 +406,7 @@ def build_culinary_strategy_payload(
     for item in items:
         if normalize_name(item.name).startswith(('онигири ', 'темаки ', 'блины ')):
             shelf_life[normalize_name(item.name)] = {'days': 2, 'source': 'Подтверждено пользователем: 2 дня'}
-    recommendations = build_recommendations(items, order_days, waste_counts, shelf_life)
+    recommendations = build_recommendations(items, order_days, waste_counts, shelf_life, include_low_volume=True)
     economics = dish_economics(effective_sales_paths, effective_waste_paths,
                               date(actual_end_day.year, actual_end_day.month, 1), actual_end_day)
     profit_ranks = {row['key']: index for index,row in enumerate(rank_profit_rows(economics['rows']))}
@@ -433,6 +448,11 @@ def build_culinary_strategy_payload(
     checks = {day: row.checks for day,row in receipts.items()}
 
     production_start = production_start_day or forecast_reference_day + timedelta(days=1)
+    forecast_as_of = production_start
+    if ordering_now is not None:
+        local_clock = ordering_now.replace(tzinfo=MOSCOW) if ordering_now.tzinfo is None else ordering_now.astimezone(MOSCOW)
+        forecast_as_of = min(production_start, local_clock.date() + timedelta(days=1 if local_clock.hour >= 18 else 0))
+    production_horizon = max(14, (production_start - forecast_as_of).days + 14)
     production_items = [
         {'key': product_key(item.name), 'name': item.name, 'category': item.group}
         for item in menu_catalog if item.enabled and item.own_production
@@ -449,11 +469,11 @@ def build_culinary_strategy_payload(
         for day, quantity in item.by_date.items():
             values[day] = values.get(day, 0) + quantity
     production_factors = {
-        (item['key'], production_start + timedelta(days=offset)):
-        _weather_factor(item['category'], [production_start + timedelta(days=offset)], float(rain_impact['applied_factor']))
-        for item in production_items for offset in range(14)
+        (item['key'], forecast_as_of + timedelta(days=offset)):
+        _weather_factor(item['category'], [forecast_as_of + timedelta(days=offset)], float(rain_impact['applied_factor']))
+        for item in production_items for offset in range(production_horizon)
     }
-    production = daily_production_plan(production_items, production_start, 14, production_history, production_factors)
+    production = daily_production_plan(production_items, forecast_as_of, production_horizon, production_history, production_factors)
     staff_plan = {}
     staff_balance: dict[str, float] = {}
     production_keys = {p['key'] for p in production_items}
@@ -469,20 +489,20 @@ def build_culinary_strategy_payload(
             if day.weekday() == 6 and int(row.get('shelf_life_days', 3)) <= 2:
                 demand[key] = 0
                 continue
-            history = recent_history(production_history.get(key, {}), production_start)
-            matching = [q for d,q in history.items() if d < production_start and d.weekday() == day.weekday()]
-            values = matching or [q for d,q in history.items() if d < production_start]
+            history = recent_history(production_history.get(key, {}), forecast_as_of)
+            matching = [q for d,q in history.items() if d < forecast_as_of and d.weekday() == day.weekday()]
+            values = matching or [q for d,q in history.items() if d < forecast_as_of]
             demand[key] = sum(values) / len(values) if values else 0
         for row in entry['rows']:
             demand[row['key']] = float(row['base_quantity'] or 0)
-        staff_plan[entry['date']] = allocate_staff(demand, STAFF_PORTIONS, staff_balance)
+        staff_plan[entry['date']] = allocate_staff(eligible_staff_demand(demand), STAFF_PORTIONS, staff_balance)
         for row in entry['rows']:
-            history = recent_history(production_history.get(row['key'], {}), production_start)
-            adjustment = traffic_adjustment(checks, history, day, production_start)
+            history = recent_history(production_history.get(row['key'], {}), forecast_as_of)
+            adjustment = traffic_adjustment(checks, history, day, forecast_as_of)
             row['receipt_factor'] = adjustment['factor']
             row['staff_quantity'] = staff_plan[entry['date']].get(row['key'], 0)
             price, cost = _unit_economics(known_economics.get(row['key']))
-            model = plan_demand(history, [day], production_start, [row['staff_quantity']],
+            model = plan_demand(history, [day], forecast_as_of, [row['staff_quantity']],
                                 [row['weather_factor'] * adjustment['factor']], price, cost, service_level,
                                 profit_tolerance=profit_tolerance)
             row.update(model=model, quantity=model['quantity'], guest_quantity=model['guest_quantity'],
@@ -494,22 +514,28 @@ def build_culinary_strategy_payload(
 
     future = _future_orders(items, supplier_menu, waste_by_date, forecast_reference_day, 4,
                             float(rain_impact['applied_factor']), checks)
+    rain_factor = float(rain_impact['applied_factor'])
+
+    def group_factors(category, days, history):
+        return [_weather_factor(category, [day], rain_factor)
+                * traffic_adjustment(checks, history, day, forecast_as_of)['factor'] for day in days]
+
     for period in future:
-        for row in period['rows']:
+        def plan_supplier_row(row, guest_limit=None):
             key = product_key(str(row['name']))
             usable = min(period['days'], int(row['shelf_life_days']))
             days = [date.fromisoformat(d['date']) for d in row['daily_forecast'][:usable]]
-            history = recent_history(production_history.get(key, {}), production_start)
+            history = recent_history(production_history.get(key, {}), forecast_as_of)
             staff = [staff_plan.get(str(day), {}).get(key, 0) for day in days]
             factors, adjustments = [], []
             for day in days:
-                adjustment = traffic_adjustment(checks, history, day, production_start)
+                adjustment = traffic_adjustment(checks, history, day, forecast_as_of)
                 adjustments.append(adjustment['factor'])
                 factors.append(_weather_factor(str(row['category']), [day], float(rain_impact['applied_factor'])) * adjustment['factor'])
             price, cost = _unit_economics(known_economics.get(key))
-            model = plan_demand(history, days, production_start, staff, factors, price, cost,
+            model = plan_demand(history, days, forecast_as_of, staff, factors, price, cost,
                                 service_level, trial_quantity=3 if row.get('is_experiment') else None,
-                                profit_tolerance=profit_tolerance)
+                                profit_tolerance=profit_tolerance, guest_limit=guest_limit)
             row['model'] = model
             for index, entry in enumerate(row['daily_forecast']):
                 planned = model['daily'][index] if index < len(model['daily']) else {'quantity':0, 'guest_quantity':0, 'staff_quantity':0}
@@ -519,6 +545,13 @@ def build_culinary_strategy_payload(
             row['quantity_unknown'] = model['quantity'] is None
             row['display_extra'] = 0
             row['remaining_is_expiry_risk'] = usable >= int(row['shelf_life_days'])
+        for row in period['rows']:
+            plan_supplier_row(row)
+        period['category_reserves'] = check_category_reserves(
+            period['rows'], production_history,
+            [date.fromisoformat(day['date']) for day in period['daily_totals']],
+            forecast_as_of, service_level, group_factors, plan_supplier_row,
+        )
         period['deadline'] = delivery_deadline(date.fromisoformat(period['start'])).isoformat()
         period['display_extra'] = sum(row['display_extra'] for row in period['rows'])
         period['supplier_quantity'] = sum(row['forecast_quantity'] for row in period['rows'])
@@ -531,12 +564,19 @@ def build_culinary_strategy_payload(
 
     traffic_forecast = [dict(date=entry['date'], **traffic_adjustment(
         checks, {day for item in items for day in item.by_date},
-        date.fromisoformat(entry['date']), production_start))
+        date.fromisoformat(entry['date']), forecast_as_of))
         for period in future for entry in period['daily_totals']]
 
     return {
-        'production_days': production[:7],
+        'monthly_loss_plan': monthly_loss_plan(loss_month, effective_sales_paths, effective_waste_paths, receipts)
+            if loss_month else None,
+        'production_days': [day for day in production if day['date'] >= production_start.isoformat()][:7],
+        'forecast_as_of': forecast_as_of.isoformat(),
         'staff_daily_portions': STAFF_PORTIONS,
+        'staff_meals_policy': {'daily_need': STAFF_PORTIONS, 'excluded': ['онигири', 'темаки'],
+                              'priority': 'годные порции с истекающим сегодня сроком, затем другие блюда витрины',
+                              'actual_expiring_stock_known': False,
+                              'allocation_is_forecast': True},
         'receipt_days': len(checks),
         'receipt_conflicts': receipt_conflicts,
         'economics': economics,
@@ -794,8 +834,7 @@ def _latest_sales_day(items: list[Any]) -> date | None:
     days = [
         day
         for item in items
-        for day, quantity in item.by_date.items()
-        if quantity > 0
+        for day in item.by_date
     ]
     return max(days) if days else None
 
@@ -1640,12 +1679,17 @@ def _render_future_orders(periods: list[dict[str, object]]) -> str:
 
 
 def _render_daily_totals(days: list[dict[str, object]]) -> str:
-    return "".join(
-        f"<div class='daily-card'><span>{escape(str(day['weekday']))}, {escape(str(day['date']))}</span>"
-        f"<strong>{day['quantity']} шт.</strong><small>{escape(str(day['weather']))}</small>"
-        f"<small>{_daily_weather_effect(day)}</small></div>"
-        for day in days
-    )
+    cards = []
+    for day in days:
+        quantity = f"{day['quantity']} шт." if day['quantity'] is not None else 'Нет данных'
+        missing = day.get('missing', 0)
+        coverage = f"<small>Неполный итог: без {missing} поз.</small>" if missing else ''
+        cards.append(
+            f"<div class='daily-card'><span>{escape(str(day['weekday']))}, {escape(str(day['date']))}</span>"
+            f"<strong>{quantity}</strong>{coverage}<small>{escape(str(day['weather']))}</small>"
+            f"<small>{_daily_weather_effect(day)}</small></div>"
+        )
+    return "".join(cards)
 
 
 def _daily_weather_effect(day: dict[str, object]) -> str:
@@ -1913,25 +1957,28 @@ def _render_operational_row(item: dict[str, object]) -> str:
     )
 
 
-def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
+def render_orders_workspace(strategy: dict[str, Any] | None, export_url: str = '') -> str:
     if strategy is None:
         return "<section class='workspace'><h2>Ближайший заказ</h2><div class='signal-box'>Загрузите отчет продаж, чтобы построить прогноз.</div></section>"
 
     current = strategy["future_orders"][0]
-    following = strategy["future_orders"][1:]
     day_headings = "".join(
         f"<th>{escape(str(day['weekday']))}<span>{escape(str(day['date']))}</span></th>"
         for day in current["daily_totals"]
     )
-    rows = "".join(_render_operational_row(item) for item in current["rows"])
-    next_cards = "".join(
-        f"<a class='next-order-card' href='/?start={period['start']}&days=14&service={round(strategy.get('demand_model', {}).get('service_level', DEFAULT_SERVICE_LEVEL) * 100)}&reserve_cost={round(strategy.get('demand_model', {}).get('profit_tolerance', DEFAULT_PROFIT_TOLERANCE) * 100)}'>"
-        f"<span>{escape(str(period['label']))} · {escape(str(period['start']))}—{escape(str(period['end']))}</span>"
-        f"<strong>{period['total_quantity']} шт.</strong>"
-        f"<small>Поставка: {period.get('supplier_quantity', period['total_quantity'])} · Собственное: {period.get('production_quantity', 0)}</small>"
-        f"<small>{escape(str(period['weather']))}</small></a>"
-        for period in following
-    )
+    supplier_rows = current["rows"]
+    rows = "".join(_render_operational_row(item) for item in supplier_rows)
+    summary = order_totals(supplier_rows, [day["date"] for day in current["daily_totals"]])
+    totals = render_order_totals(summary)
+    supplier_days = [
+        {**day, 'quantity': total['value'], 'missing': total['missing']}
+        for day, total in zip(current['daily_totals'], summary['daily'])
+    ]
+    supplier_staff = sum(row.get('staff_quantity', 0) for row in supplier_rows)
+    quantity = summary['quantity']['value']
+    order_badge = f'<strong>{quantity}</strong><small>порций</small>' if quantity is not None else '<small>Нет данных</small>'
+    missing = summary['quantity']['missing']
+    order_coverage = f'<span>Неполный итог: без {missing} поз.</span>' if missing else ''
     rain_days = sum(1 for day in current["daily_totals"] if day["rain"])
     missing_weather = sum(1 for day in current["daily_totals"] if not day["weather_available"])
     short_shelf = sum(1 for item in current["rows"] if int(item["shelf_life_days"]) < int(current["days"]))
@@ -1945,29 +1992,35 @@ def render_orders_workspace(strategy: dict[str, Any] | None) -> str:
     alert_html = "".join(f"<span class='alert-chip'>{escape(alert)}</span>" for alert in alerts) or "<span class='ok-chip'>Критичных предупреждений нет</span>"
     updated = strategy["weather_updated_at"] or "нет данных"
 
+    export_html = (
+        f'<div class="order-export"><a href="{escape(export_url, quote=True)}" download>Скачать Excel: кулинария + ТТ</a>'
+        '<p class="muted">Поставка с общим количеством по блюдам и отдельный план ТТ по дням. '
+        'Каждый лист настроен на печать на одной странице А4.</p></div>'
+        if export_url else ''
+    )
     return f"""
     <section class="workspace order-focus">
       <div class="workspace-head">
         <div><span class="eyebrow">Ближайший заказ</span><h2>{current['label']} · {current['start']}—{current['end']}</h2>
         <div class="muted">Продажи учтены по {strategy['period'].split('..')[-1]} · погода: {escape(str(strategy['weather_source']))}, {escape(str(updated))}</div></div>
         <div class="order-totals">
-          <div class="order-total"><span>Всего план</span><strong>{current['total_quantity']}</strong><small>штук</small></div>
-          <div class="order-total supplier"><span>Заказать</span><strong>{current.get('supplier_quantity', current['total_quantity'])}</strong><small>поставка</small></div>
-          <div class="order-total production"><span>Произвести</span><strong>{current.get('production_quantity', 0)}</strong><small>собственное</small></div>
+          <div class="order-total supplier"><span>Заказать</span>{order_badge}{order_coverage}</div>
         </div>
       </div>
-      <div class="daily-strip">{_render_daily_totals(current['daily_totals'])}</div>
+      <div class="daily-strip">{_render_daily_totals(supplier_days)}</div>
+      {export_html}
+      <div class="table-wrap">
+        <table class="order-table"><thead><tr><th>Позиция</th>{day_headings}<th>Итого</th><th>Цена продажи<br>порции, ₽</th><th>Стоимость всех<br>порций, ₽</th><th>Маржа порции<br>₽ / %</th><th>Маржа плана<br>₽ / %</th><th>Статус</th><th></th></tr></thead><tbody>{rows}</tbody>{totals}</table>
+      </div>
+      <p class="muted">Итоги относятся к поставке; ТТ показана отдельно. Цены за порцию и проценты не суммируются. Неполные денежные итоги помечены. Формулы и роль блюда в меню — в «Подробнее».</p>
       <p>Заказ до <strong>{escape(str(current.get('deadline', ''))).replace('T', ' ')}</strong> (Москва).
       Поставка утром до открытия. Правило: на послезавтра до 18:00 МСК, только Пн/Ср/Пт.</p>
-      <p>В плане питание сотрудников: {current.get('staff_quantity', 0)} порций по поставке и ТТ вместе.
+      <p>В эту поставку включено питание сотрудников: {supplier_staff} порций.
       Потребность рассчитана без технической кратности и минимальных партий. Резерв на колебания спроса указан в «Подробнее».</p>
       <div class="alert-row">{alert_html}</div>
       {_render_order_calculation_block(strategy, current)}
-      <div class="table-wrap">
-        <table class="order-table"><thead><tr><th>Позиция</th><th>Тип</th>{day_headings}<th>Итого</th><th>Статус</th><th></th></tr></thead><tbody>{rows}</tbody></table>
-      </div>
+      {render_category_reserves(current.get('category_reserves', []))}
     </section>
-    <section class="next-orders"><div class="section-title"><div><span class="eyebrow">Далее</span><h2>Следующие заказы</h2></div><a href="/analytics">Открыть аналитику →</a></div><div class="next-order-grid">{next_cards}</div></section>
     <dialog id="item-dialog"><button class="dialog-close" aria-label="Закрыть">×</button><div id="dialog-content"></div></dialog>
     """
 
@@ -1982,25 +2035,25 @@ def _render_order_calculation_block(strategy: dict[str, Any], current: dict[str,
           <li><strong>Меню:</strong> в расчет попадают включенные позиции меню; отключенные позиции исключаются вручную.</li>
           <li><strong>Тип:</strong> поставка и собственное производство задаются в «Меню»; подтвержденные 5 блюд ТТ считаются отдельно от 32 мест поставки.</li>
           <li><strong>Корректировки:</strong> срок годности ограничивает окно спроса, чеки и погода применяются один раз. Частота прошлых списаний не вычитается из спроса: риск остатка оценивается отдельно, известные потери влияют на выбор блюд.</li>
-          <li><strong>Итог:</strong> экономический объем с резервом к желаемому наличию, ограниченным допустимой ценой потерь, + доля 5 порций питания в день. Партии и минимальные объемы для обычных блюд не применяются. Расчет показывает потребность; фактический доступный остаток здесь не вычитается.</li>
+          <li><strong>Итог:</strong> экономический объем с резервом к желаемому наличию, ограниченным допустимой ценой потерь, плюс порции питания, отнесенные к поставке. Партии и минимальные объемы для обычных блюд не применяются. Расчет показывает потребность; фактический доступный остаток здесь не вычитается.</li>
         </ol>
       </section>
     """
 
 
 def _render_operational_row(item: dict[str, object]) -> str:
-    day_cells = "".join(f"<td class='number'><strong>{'—' if item.get('quantity_unknown') else day['quantity']}</strong><br><small>гостям с резервом {day.get('guest_quantity', day['quantity'])} + питание {day.get('staff_quantity', 0)}<br>чеки ×{day.get('receipt_factor', 1)}</small></td>" for day in item["daily_forecast"])
-    status = str(item.get("waste_risk", "контроль"))
+    day_cells = "".join(f"<td class='number'><strong>{'—' if item.get('quantity_unknown') else day['quantity']}</strong></td>" for day in item['daily_forecast'])
+    status, role = assortment_status(item)
     supply_type = str(item.get("supply_type", "supplier"))
     supply_label = "Собственное" if supply_type == "own_production" else "Поставка"
     supply_class = "production" if supply_type == "own_production" else "supplier"
     details_html = _render_item_details(item, supply_label)
     return (
         f"<tr class='{supply_class}'><td><strong>{escape(str(item['name']))}</strong><span>{escape(str(item['category']))}</span></td>"
-        f"<td><span class='type-chip {supply_class}'>{escape(supply_label)}</span></td>"
         f"{day_cells}<td class='number total-cell'>{'нет данных' if item.get('quantity_unknown') else item['forecast_quantity']}</td>"
-        f"<td><i class='{_risk_class(status)}'>{escape(status)}</i></td>"
-        f"<td><button class='detail-button' data-name='{escape(str(item['name']), quote=True)}'>Подробнее</button><template>{details_html}</template></td></tr>"
+        + finance_cells(item)
+        + f"<td><i class='menu-status {role}' title='{escape(status_explanation(item), quote=True)}'>{escape(status)}</i></td>"
+        + f"<td><button class='detail-button' data-name='{escape(str(item['name']), quote=True)}'>Подробнее</button><template>{details_html}</template></td></tr>"
     )
 
 
@@ -2015,7 +2068,6 @@ def _render_item_details(item: dict[str, object], supply_label: str) -> str:
         <span class="eyebrow">Детали позиции</span>
         <h2>{escape(str(item['name']))}</h2>
         <dl>
-          <dt>Тип</dt><dd>{escape(supply_label)}</dd>
           <dt>Категория</dt><dd>{escape(str(item['category']))}</dd>
           <dt>Итог к заказу</dt><dd>{item['forecast_quantity']} шт.</dd>
           <dt>Продажи за весь период</dt><dd>{item.get('sales_june_july', 0)} шт.</dd>
@@ -2029,6 +2081,8 @@ def _render_item_details(item: dict[str, object], supply_label: str) -> str:
         </dl>
         <h3>Разбивка по дням</h3>
         <ul>{daily_rows}</ul>
+        {finance_details(item)}
+        {status_details(item)}
         {model_details(item.get('model', {}), item.get('remaining_is_expiry_risk', True))}
       </div>
     """
@@ -2063,8 +2117,10 @@ def render_production_workspace(strategy: dict[str, Any] | None) -> str:
 def render_staff_and_economics(strategy: dict[str, Any] | None, view: str) -> str:
     if not strategy:
         return ''
+    staff_note = ('В заказе показаны порции питания, отнесенные к поставке.' if view == 'orders' else
+                  'В план включено 5 порций сотрудникам в день, суммарно по поставке и ТТ.')
     block = f'''<section class="calculation-box"><h3>Питание сотрудников и динамика спроса</h3>
-    <p>В план включено 5 порций сотрудникам в день, суммарно по поставке и ТТ. Питание отсутствует в реализации и списывается отдельными актами, поэтому добавляется к гостевому спросу. Выбор блюд оценивается по структуре продаж и может отличаться от факта.</p>
+    <p>{staff_note} Питание отсутствует в реализации и списывается отдельными актами, поэтому добавляется к гостевому спросу. Выбор блюд оценивается по структуре продаж и может отличаться от факта.</p>
     <p>Загружены чеки за {strategy.get('receipt_days', 0)} дней. Учитываются недавние одинаковые дни недели и аналог будущего дня год назад с поправкой на текущую динамику. Ограничение ×0,7…1,3. Конфликтов дат: {strategy.get('receipt_conflicts', 0)}. <a href="/analytics#traffic">История прошлого года и расчет потока</a>. Питание не входит в целевые списания 2%.</p></section>'''
     source = strategy.get('menu_source', {})
     missing = source.get('without_november_sales', [])
@@ -2076,7 +2132,9 @@ def render_staff_and_economics(strategy: dict[str, Any] | None, view: str) -> st
         return render_demand_method(strategy, view) + block + render_loss_kpi(strategy.get('loss_kpi', {}))
     economics = strategy.get('economics', {})
     rows = ''.join(f"<tr><td>{escape(r['name'])}</td><td>{r['sold']:g}</td><td>{r['revenue']:.2f}</td><td>{r['gross_profit']:.2f}</td><td>{r['waste_quantity']:g}</td><td>{r['waste_cost']:.2f}</td><td>{r['staff_cost']:.2f}</td><td>{r['profit_after_known_costs']:.2f}</td><td>{r['margin_after_known_costs'] if r['margin_after_known_costs'] is not None else '—'}</td></tr>" for r in economics.get('rows', []))
-    return (render_demand_method(strategy, view) + block + render_loss_kpi(strategy.get('loss_kpi', {}))
+    loss_plan = strategy.get('monthly_loss_plan')
+    return ((render_monthly_loss_plan(loss_plan) if loss_plan else '')
+            + render_demand_method(strategy, view) + block + render_loss_kpi(strategy.get('loss_kpi', {}))
             + render_matrix(strategy.get('matrix_proposal', {}))
             + render_traffic(strategy.get('traffic_history', {}), strategy.get('traffic_forecast', []))
             + _render_menu_coverage_block(strategy.get('menu_coverage', {}))) + f'''<section><h2>Прибыль по каждому блюду после известных списаний</h2>
@@ -2103,12 +2161,16 @@ def render_weather_status(strategy: dict[str, Any] | None) -> str:
     <p>Дождь меняет поток покупателей; температура и осадки дополнительно корректируют категории. Коэффициент ×1 означает отсутствие изменения, ×0,9 — снижение на 10%. Если прогноза на дату нет, применяется ×1. Для заказа точный коэффициент позиции указан в «Подробнее», для «Кулинарии ТТ» — в каждой ячейке.</p></section>'''
 
 
-def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
+def render_dashboard_html(payload: dict[str, Any], view: str = "orders", export_url: str = '') -> str:
     events = payload["events"][:14]
     budget = payload["budget"]
     max_budget = max([*budget.values(), 1])
     service_percent = round(payload.get('culinary_strategy', {}).get('demand_model', {}).get('service_level', DEFAULT_SERVICE_LEVEL) * 100) if payload.get('culinary_strategy') else 85
     reserve_percent = round(payload.get('culinary_strategy', {}).get('demand_model', {}).get('profit_tolerance', DEFAULT_PROFIT_TOLERANCE) * 100) if payload.get('culinary_strategy') else 5
+    dates = payload.get('order_dates', [])
+    periods = (payload.get('culinary_strategy') or {}).get('future_orders', [])
+    selected_order = periods[0]['start'] if periods else (dates[0] if dates else '')
+    order_date_tabs = render_order_date_tabs(dates, selected_order, service_percent, reserve_percent) if view == 'orders' else ''
 
     budget_rows = "\n".join(
         f"""
@@ -2141,10 +2203,11 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
         render_culinary_strategy_html(payload.get("culinary_strategy"))
         if view == "analytics"
         else (render_production_workspace(payload.get("culinary_strategy")) if view == 'production'
-              else render_orders_workspace(payload.get("culinary_strategy")))
+              else render_orders_workspace(payload.get("culinary_strategy"), export_url=export_url))
     )
-    culinary_strategy = render_weather_status(payload.get('culinary_strategy')) + culinary_strategy
+    weather_section = render_weather_status(payload.get('culinary_strategy'))
     culinary_strategy += render_staff_and_economics(payload.get('culinary_strategy'), view)
+    culinary_strategy = culinary_strategy + weather_section if view == 'orders' else weather_section + culinary_strategy
 
     return f"""<!doctype html>
 <html lang="ru">
@@ -2188,6 +2251,12 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     nav {{ display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }}
     nav a {{ color: var(--muted); text-decoration: none; padding: 7px 10px; border-radius: 7px; }}
     nav a.active, nav a:hover {{ color: var(--green); background: var(--panel-soft); }}
+    .order-date-tabs {{ display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; margin: 16px 0; }}
+    .order-date-tabs a {{ text-align: center; font-size: 14px; padding: 12px 6px; border: 1px solid var(--line); background: var(--panel); white-space: nowrap; }}
+    .order-date-tabs a.active, .order-date-tabs a.active:hover {{ color: white; background: var(--green); border-color: var(--green); }}
+    .order-date-tabs a:focus-visible {{ outline: 2px solid var(--green); outline-offset: 3px; }}
+    @media (max-width: 900px) {{ .order-date-tabs {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }} }}
+    @media (max-width: 480px) {{ .order-date-tabs {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
     h1 {{ margin: 0; font-size: 30px; line-height: 1.1; }}
     h2 {{ margin: 0 0 12px; font-size: 18px; }}
     .muted {{ color: var(--muted); }}
@@ -2255,7 +2324,7 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     .eyebrow {{ display: block; color: var(--green); font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 5px; }}
     .order-focus {{ padding: 22px; }}
     .order-focus h2 {{ font-size: 25px; margin-bottom: 5px; }}
-    .order-totals {{ display: grid; grid-template-columns: repeat(3, minmax(120px, 1fr)); gap: 8px; min-width: 430px; }}
+    .order-totals {{ display: grid; grid-template-columns: 1fr; }}
     .order-total {{ min-width: 150px; padding: 14px 18px; border-radius: 10px; background: var(--green); color: white; display: grid; grid-template-columns: auto auto; align-items: baseline; gap: 0 8px; }}
     .order-total.supplier {{ background: #265f8f; }}
     .order-total.production {{ background: #7a5230; }}
@@ -2270,6 +2339,14 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     .order-table th span, .order-table td span {{ display: block; color: var(--muted); font-size: 11px; margin-top: 3px; }}
     .order-table .number {{ text-align: right; font-variant-numeric: tabular-nums; }}
     .order-table .total-cell {{ font-weight: 800; color: var(--green); }}
+    .order-summary {{ background: var(--panel-soft); }}
+    .order-summary th, .order-summary td {{ border-top: 2px solid var(--green); }}
+    .order-summary small {{ display: block; max-width: 145px; color: #775009; font-weight: normal; }}
+    .menu-status {{ display: inline-block; border-radius: 999px; padding: 6px 9px; font-size: 12px; font-weight: 700; white-space: nowrap; font-style: normal; }}
+    .menu-status.core {{ background: #dfece3; color: #28513d; }}
+    .menu-status.rotation {{ background: #f7e6bd; color: #775009; }}
+    .menu-status.trial {{ background: #e7f0f8; color: #265f8f; }}
+    .menu-status.unknown {{ background: #eee; color: #555; }}
     .type-chip {{ display: inline-block; padding: 5px 8px; border-radius: 999px; font-size: 12px; font-weight: 800; white-space: nowrap; }}
     .type-chip.supplier {{ background: #e7f0f8; color: #265f8f; }}
     .type-chip.production {{ background: #f4ece4; color: #7a5230; }}
@@ -2287,6 +2364,11 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     .calculation-box h3 {{ margin: 0 0 10px; }}
     .calculation-box ol {{ margin: 0; padding-left: 20px; line-height: 1.55; color: var(--muted); }}
     .detail-button {{ border: 0; background: transparent; color: var(--green); cursor: pointer; font-weight: 700; padding: 6px; }}
+    .order-export {{ margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--line); }}
+    .order-export a {{ display: inline-block; padding: 12px 18px; background: var(--green); color: white; border-radius: 10px; text-decoration: none; font-weight: 700; }}
+    .order-total.production a {{ color: inherit; }}
+    .order-table .order-finance {{ min-width: 115px; font-variant-numeric: tabular-nums; }}
+    .order-table .order-finance small {{ display: block; max-width: 145px; white-space: normal; font-weight: normal; }}
     .next-orders {{ margin-top: 16px; }}
     .section-title {{ display: flex; justify-content: space-between; align-items: end; gap: 12px; }}
     .next-order-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }}
@@ -2479,10 +2561,12 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
       <div>
         <h1>Заказы кулинарии</h1>
         <div class="muted">Обеды, салаты, роллы и горячие блюда на ближайшие периоды</div>
-        <nav><a class="{'active' if view == 'orders' else ''}" href="/?service={service_percent}&reserve_cost={reserve_percent}">Заказы</a><a class="{'active' if view == 'production' else ''}" href="/production?service={service_percent}&reserve_cost={reserve_percent}">Кулинария ТТ</a><a class="{'active' if view == 'analytics' else ''}" href="/analytics?service={service_percent}&reserve_cost={reserve_percent}">Аналитика</a><a href="/menu">Меню</a><a href="/reports">Отчёты</a><a href="/settings">Настройки</a></nav>
+        <nav><a class="{'active' if view == 'orders' else ''}" href="/?service={service_percent}&reserve_cost={reserve_percent}">Заказы</a><a class="{'active' if view == 'production' else ''}" href="/production?start={selected_order if view == 'orders' else payload['start_day']}&amp;service={service_percent}&amp;reserve_cost={reserve_percent}">Кулинария ТТ</a><a class="{'active' if view == 'analytics' else ''}" href="/analytics?service={service_percent}&reserve_cost={reserve_percent}">Аналитика</a><a href="/menu">Меню</a><a href="/reports">Отчёты</a><a href="/settings">Настройки</a></nav>
       </div>
       <div><a href="/reports">Ежемесячные отчеты</a><div class="muted">{payload["start_day"]} · {payload["horizon_days"]} дней</div></div>
     </header>
+
+    {order_date_tabs}
 
     {culinary_strategy}
 
@@ -2534,29 +2618,7 @@ def render_dashboard_html(payload: dict[str, Any], view: str = "orders") -> str:
     </div>
     </div>
   </main>
-  <script>
-    const dialog = document.getElementById('item-dialog');
-    document.querySelectorAll('.detail-button').forEach(button => button.addEventListener('click', () => {{
-      const content = document.getElementById('dialog-content');
-      const template = button.parentElement.querySelector('template');
-      content.replaceChildren(template ? template.content.cloneNode(true) : document.createTextNode('Детали недоступны'));
-      if (typeof dialog.showModal === 'function') {{
-        dialog.showModal();
-      }} else {{
-        dialog.setAttribute('open', 'open');
-      }}
-    }}));
-    const closeDialog = () => {{
-      if (!dialog) return;
-      if (typeof dialog.close === 'function') {{
-        dialog.close();
-      }} else {{
-        dialog.removeAttribute('open');
-      }}
-    }};
-    document.querySelector('.dialog-close')?.addEventListener('click', closeDialog);
-    dialog?.addEventListener('click', event => {{ if (event.target === dialog) closeDialog(); }});
-  </script>
+  <script src="/assets/orders.js" defer></script>
 </body>
 </html>"""
 
@@ -2583,6 +2645,12 @@ def save_upload_batch(files: list[tuple[str, bytes]], save: Any) -> tuple[str, s
         except (ReportValidationError, OSError) as error:
             errors.append(f'{Path(filename).name}: {error}')
     return (f'Загружено: {len(saved)} из {len(files)}. ' + '; '.join(saved), '; '.join(errors))
+
+
+class DashboardServer(ThreadingHTTPServer):
+    def __init__(self, *args: Any, **kwargs: Any):
+        self.order_exports = OrderExportStore()
+        super().__init__(*args, **kwargs)
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -2624,8 +2692,38 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if not self._authorize():
             return
+        if parsed.path == '/assets/orders.js':
+            content = ORDER_DETAILS_SCRIPT.encode('utf-8')
+            self.send_response(HTTPStatus.OK)
+            self.send_header('Content-Type', 'application/javascript; charset=utf-8')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Content-Length', str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
         if parsed.path == "/":
-            self._send_html(render_dashboard_html(_payload_from_query(parsed.query)))
+            payload = _payload_from_query(parsed.query)
+            strategy = payload.get('culinary_strategy')
+            export_url = ''
+            if strategy:
+                token = self.server.order_exports.add(prepare_order_download(strategy))
+                export_url = f'/orders/export.xlsx?snapshot={token}'
+            self._send_html(render_dashboard_html(payload, export_url=export_url))
+            return
+        if parsed.path == '/orders/export.xlsx':
+            token = parse_qs(parsed.query).get('snapshot', [''])[0]
+            download = self.server.order_exports.get(token)
+            if download is None:
+                self._send_error_page(HTTPStatus.GONE, 'Снимок заказа больше недоступен. Обновите страницу заказа и скачайте Excel еще раз.')
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header('Content-Type', ORDER_WORKBOOK_MIME)
+            self.send_header('Content-Disposition', f'attachment; filename="{download.filename}"')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Content-Length', str(len(download.content)))
+            self.end_headers()
+            self.wfile.write(download.content)
             return
         if parsed.path == "/api/dashboard":
             self._send_json(_payload_from_query(parsed.query))
@@ -2634,7 +2732,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(build_data_status())
             return
         if parsed.path == "/analytics":
-            self._send_html(render_dashboard_html(_payload_from_query(parsed.query), view="analytics"))
+            params = parse_qs(parsed.query)
+            default_month = max(moscow_now().date().replace(day=1), date(2026, 12, 1))
+            try:
+                month = date.fromisoformat(params.get('loss_month', [default_month.isoformat()[:7]])[0] + '-01')
+            except ValueError:
+                self._send_error_page(HTTPStatus.BAD_REQUEST, 'Укажите месяц в формате ГГГГ-ММ.')
+                return
+            self._send_html(render_dashboard_html(_payload_from_query(parsed.query, loss_month=month), view="analytics"))
             return
         if parsed.path == '/production':
             self._send_html(render_dashboard_html(_payload_from_query(parsed.query), view='production'))
@@ -2675,6 +2780,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._redirect(f"/reports?message={_url_quote('Настройки сохранены')}")
             return
         if not self._authorize():
+            return
+        if parsed.path == "/analytics/loss-plan":
+            if self.headers.get('Sec-Fetch-Site') == 'cross-site':
+                self._send_error_page(HTTPStatus.FORBIDDEN, 'Откройте форму в разделе «Аналитика».')
+                return
+            fields = self._read_form_urlencoded()
+            try:
+                save_loss_plan(loss_plan_path(), fields.get('month', ''), fields.get('revenue', ''), fields.get('remaining', ''))
+            except ValueError as error:
+                self._send_error_page(HTTPStatus.BAD_REQUEST, str(error))
+                return
+            self._redirect(f"/analytics?loss_month={_url_quote(fields['month'])}#loss-plan")
             return
         if parsed.path == "/menu/toggle":
             fields = self._read_form_urlencoded()
@@ -3360,12 +3477,12 @@ def server_port() -> int:
 
 def run_server() -> None:
     port = server_port()
-    server = ThreadingHTTPServer(("0.0.0.0", port), DashboardHandler)
+    server = DashboardServer(("0.0.0.0", port), DashboardHandler)
     print(json.dumps({"level": "info", "event": "server_started", "port": port}))
     server.serve_forever()
 
 
-def _payload_from_query(query: str) -> dict[str, Any]:
+def _payload_from_query(query: str, *, loss_month: date | None = None) -> dict[str, Any]:
     params = parse_qs(query)
     start_raw = params.get("start", [None])[0]
     days_raw = params.get("days", ["14"])[0]
@@ -3374,6 +3491,7 @@ def _payload_from_query(query: str) -> dict[str, Any]:
         horizon_days=int(days_raw),
         service_level=float(params.get('service', ['85'])[0]) / 100,
         profit_tolerance=float(params.get('reserve_cost', ['5'])[0]) / 100,
+        **({'loss_month': loss_month} if loss_month is not None else {}),
     )
 
 
