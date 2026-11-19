@@ -78,6 +78,7 @@ from src.infrastructure.report_analytics import (
 )
 from src.infrastructure.assortment_catalog import load_candidates
 from src.infrastructure.menu_uploads import menu_upload_directory
+from src.infrastructure.menu_prices import load_menu_prices
 from src.domain.assortment import rank_profit_rows, propose_matrix
 from src.domain.order_policy import (
     DISPLAY_CAPACITY, STAFF_PORTIONS, MOSCOW, moscow_now, earliest_delivery,
@@ -94,6 +95,7 @@ DEFAULT_SHELF_LIFE_PATH = project_path("data/local/Хранение и срок�
 BUNDLED_PREVIOUS_ORDERS_DIR = project_path("Прошлые заказы")
 DEFAULT_PREVIOUS_ORDERS_DIR = menu_upload_directory()
 DEFAULT_MENU_STATE_PATH = project_path("data/menu/menu-state.json")
+DEFAULT_MENU_PRICES_PATH = appdata_env_path().with_name('menu-prices.json')
 DEFAULT_ORDER_CYCLE_DAYS = 2
 MAX_BATCH_FILES = 100
 MAX_BATCH_UPLOAD_MB = 250
@@ -423,7 +425,19 @@ def build_culinary_strategy_payload(
         _with_decision_explanations(build_daily_menu(recommendations, ranked=True, capacity=DISPLAY_CAPACITY)),
         own_production_names,
     )
-    matrix = propose_matrix(load_candidates(menu_catalog), economics['rows'], DISPLAY_CAPACITY)
+    candidates = load_candidates(menu_catalog)
+    menu_prices = load_menu_prices(DEFAULT_MENU_PRICES_PATH)
+    prices_by_key = dict(menu_prices.by_name)
+    prices_by_key.update(
+        {row['key']: menu_prices.by_sku[row['sku']] for row in candidates if row.get('sku') in menu_prices.by_sku}
+    )
+
+    def economics_for(key: str) -> tuple[float | None, float | None, str]:
+        current_price = prices_by_key.get(key)
+        price, cost = _unit_economics(known_economics.get(key), current_price)
+        return price, cost, 'menu' if current_price is not None else 'sales'
+
+    matrix = propose_matrix(candidates, economics['rows'], DISPLAY_CAPACITY)
     if len(matrix['rows']) == DISPLAY_CAPACITY and economics['rows'] and menu_catalog:
         historical = {product_key(str(row['name'])): row for row in build_daily_menu(
             recommendations, ranked=True, capacity=len(recommendations))}
@@ -501,10 +515,11 @@ def build_culinary_strategy_payload(
             adjustment = traffic_adjustment(checks, history, day, forecast_as_of)
             row['receipt_factor'] = adjustment['factor']
             row['staff_quantity'] = staff_plan[entry['date']].get(row['key'], 0)
-            price, cost = _unit_economics(known_economics.get(row['key']))
+            price, cost, price_source = economics_for(row['key'])
             model = plan_demand(history, [day], forecast_as_of, [row['staff_quantity']],
                                 [row['weather_factor'] * adjustment['factor']], price, cost, service_level,
                                 profit_tolerance=profit_tolerance)
+            model['price_source'] = price_source
             row.update(model=model, quantity=model['quantity'], guest_quantity=model['guest_quantity'],
                        need=model['quantity'], batch_size=1, batch_extra=0)
         entry['total'] = sum(row['quantity'] or 0 for row in entry['rows'])
@@ -532,10 +547,11 @@ def build_culinary_strategy_payload(
                 adjustment = traffic_adjustment(checks, history, day, forecast_as_of)
                 adjustments.append(adjustment['factor'])
                 factors.append(_weather_factor(str(row['category']), [day], float(rain_impact['applied_factor'])) * adjustment['factor'])
-            price, cost = _unit_economics(known_economics.get(key))
+            price, cost, price_source = economics_for(key)
             model = plan_demand(history, days, forecast_as_of, staff, factors, price, cost,
                                 service_level, trial_quantity=3 if row.get('is_experiment') else None,
                                 profit_tolerance=profit_tolerance, guest_limit=guest_limit)
+            model['price_source'] = price_source
             row['model'] = model
             for index, entry in enumerate(row['daily_forecast']):
                 planned = model['daily'][index] if index < len(model['daily']) else {'quantity':0, 'guest_quantity':0, 'staff_quantity':0}
@@ -631,12 +647,13 @@ def align_sales_with_menu(items: list[Any], menu_catalog: list[Any]) -> list[Any
     return _merge_sales_items([aligned])
 
 
-def _unit_economics(row: dict | None) -> tuple[float | None, float | None]:
+def _unit_economics(row: dict | None, current_price: int | None = None) -> tuple[float | None, float | None]:
     if not row or row.get('sold', 0) <= 0:
-        return None, None
-    price = row['revenue'] / row['sold']
+        return current_price, None
+    average_price = row['revenue'] / row['sold']
+    price = current_price if current_price is not None else (average_price if average_price > 0 else None)
     cost = (row['revenue'] - row['gross_profit']) / row['sold']
-    return (price, cost) if price > 0 and 0 < cost <= price else (None, None)
+    return price, cost if cost > 0 else None
 
 
 def _merge_sales_items(groups: list[list[Any]]) -> list[Any]:

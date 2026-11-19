@@ -1,6 +1,6 @@
 ﻿[project]
 name = "purchase-forecast-service"
-version = "0.5.8"
+version = "0.5.10"
 description = "Personal service for expense analytics, meal planning, home tasks, and purchase forecasting."
 requires-python = ">=3.11"
 dependencies = []

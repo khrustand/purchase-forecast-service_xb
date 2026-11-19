@@ -13,6 +13,40 @@ from src.app.order_finance import order_financials, finance_cells
 
 
 class OrderFinanceTests(TestCase):
+    def test_current_price_by_sku_changes_order_valuation_and_keeps_historical_cost(self):
+        from tests.synthetic_sales import dashboard_fixture
+        name = 'Суп лапша куриный 0,300'
+        key = web.product_key(name)
+        menu = [SimpleNamespace(sku='00001', name=name, normalized_name=key, group='Супы',
+                                enabled=True, own_production=False)]
+        candidates = [{'sku': '00001', 'key': key, 'name': name, 'category': 'Супы'}]
+        economics = {
+            'start': '2026-08-01', 'end': '2026-08-03', 'detailed_waste_days': 0,
+            'rows': [{'key': key, 'name': name, 'sold': 20, 'revenue': 2330, 'gross_profit': 1030,
+                      'profit_after_known_costs': 1030, 'waste_cost': 0}],
+        }
+        with (dashboard_fixture(web),
+              patch.object(web, 'apply_menu_state', return_value=menu),
+              patch.object(web, 'load_candidates', return_value=candidates),
+              patch.object(web, 'dish_economics', return_value=economics)):
+            web.DEFAULT_MENU_PRICES_PATH.write_text('{"00001":139}', encoding='utf-8')
+            result = web.build_dashboard_payload(start_day=date(2026, 8, 5), now=datetime(2026, 8, 2, 12))
+        strategy = result['culinary_strategy']
+        item = strategy['future_orders'][0]['rows'][0]
+        values = order_financials(item)
+        self.assertEqual(item['model']['price_source'], 'menu')
+        self.assertEqual((values['price'], values['cost'], values['unit_margin']), (139, 65, 74))
+        self.assertEqual(values['retail_value'], 139 * item['forecast_quantity'])
+        self.assertIn('>139</td>', finance_cells(item))
+        self.assertEqual(strategy['economics']['rows'][0]['revenue'], 2330)
+
+    def test_trial_with_price_and_without_cost_can_show_retail_value(self):
+        price, cost = web._unit_economics(None, 410)
+        values = order_financials({'forecast_quantity': 3, 'model': {'price': price, 'cost': cost}})
+        self.assertEqual(values['retail_value'], 1230)
+        self.assertIsNone(values['unit_margin'])
+        self.assertIsNone(values['expected_margin'])
+
     def test_retail_value_and_expected_margin_do_not_count_staff_as_sales(self):
         item = {'forecast_quantity': 10, 'model': {'price': 200, 'cost': 80,
                 'expected_guest_sales': 7, 'expected_profit': 600}}
@@ -47,7 +81,14 @@ class ConsistentCalendarPlanTests(TestCase):
         with dashboard_fixture(web), patch.object(web, 'apply_menu_state', return_value=catalog), \
              patch.object(web, 'load_menu_state', return_value=MenuCatalogState(disabled=set())), \
              patch.object(web, 'extract_items', return_value=history):
+            web.DEFAULT_MENU_PRICES_PATH.write_text(
+                '{"by_name":{"*Каша овсяная 0,250":99,"*Тестовый омлет 0,180 ТТ":154}}', encoding='utf-8',
+            )
             base = web.build_dashboard_payload(now=clock)['culinary_strategy']
+            first_day = base['production_days'][0]['rows']
+            oatmeal = next(row for row in first_day if row['name'] == 'Каша овсяная 0,250')
+            self.assertEqual((oatmeal['model']['price'], oatmeal['model']['price_source']), (99, 'menu'))
+            self.assertNotIn('*Тестовый омлет 0,180 ТТ', {row['name'] for row in first_day})
             for selected in (date(2026,11,23), date(2026,11,25)):
                 strategy = web.build_dashboard_payload(start_day=selected,now=clock)['culinary_strategy']
                 same = {d['date']:d for d in base['production_days']}

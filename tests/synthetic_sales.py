@@ -50,7 +50,8 @@ def dashboard_fixture(web):
         storage = SimpleNamespace(paths=lambda kind: [source] if kind == 'sales' else [], list=lambda: [],
                                   storage_label=lambda: 'Supabase')
         for name, value in [('REPORT_STORAGE', storage), ('DEFAULT_PREVIOUS_ORDERS_DIR', Path(directory) / 'no-menu'),
-                            ('DEFAULT_MENU_STATE_PATH', Path(directory) / 'menu-state.json')]:
+                            ('DEFAULT_MENU_STATE_PATH', Path(directory) / 'menu-state.json'),
+                            ('DEFAULT_MENU_PRICES_PATH', Path(directory) / 'menu-prices.json')]:
             stack.enter_context(patch.object(web, name, value))
         stack.enter_context(patch.object(web, 'load_met_norway_forecast', return_value=None))
         stack.enter_context(patch.object(web, 'load_candidates', return_value=[]))

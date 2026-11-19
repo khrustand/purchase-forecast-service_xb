@@ -6,7 +6,7 @@ def order_financials(item: dict) -> dict:
     model = item.get('model', {})
     price, cost = model.get('price'), model.get('cost')
     quantity = None if item.get('quantity_unknown') else item.get('forecast_quantity')
-    priced = price is not None and cost is not None and price > 0 and 0 < cost <= price
+    priced = price is not None and cost is not None and price > 0 and cost > 0
     unit_margin = price - cost if priced else None
     expected_revenue = price * model['expected_guest_sales'] if price is not None and model.get('expected_guest_sales') is not None else None
     profit = model.get('expected_profit')
@@ -22,24 +22,36 @@ def _money(value) -> str:
     return f'{value:,.2f}'.replace(',', ' ') if value is not None else 'нет данных'
 
 
+def _retail_money(value) -> str:
+    if value is not None and float(value).is_integer():
+        return f'{value:,.0f}'.replace(',', ' ')
+    return _money(value)
+
+
 def finance_cells(item: dict) -> str:
     values = order_financials(item)
     unit_percent = f"{values['unit_margin_percent']:.1f}%" if values['unit_margin_percent'] is not None else '—'
     plan_percent = f"{values['expected_margin_percent']:.1f}%" if values['expected_margin_percent'] is not None else '—'
-    return (f"<td class='number order-finance'>{_money(values['price'])}</td>"
-            f"<td class='number order-finance'>{_money(values['retail_value'])}</td>"
+    source = '<small>средняя по продажам</small>' if (
+        values['price'] is not None and item.get('model', {}).get('price_source') == 'sales'
+    ) else ''
+    return (f"<td class='number order-finance'>{_retail_money(values['price'])}{source}</td>"
+            f"<td class='number order-finance'>{_retail_money(values['retail_value'])}</td>"
             f"<td class='number order-finance'>{_money(values['unit_margin'])}<small>{unit_percent}</small></td>"
             f"<td class='number order-finance'>{_money(values['expected_margin'])}<small>{plan_percent}</small></td>")
 
 
 def finance_details(item: dict) -> str:
     values = order_financials(item)
-    return (f"<section><h3>Цена и маржа</h3><dl><dt>Цена продажи порции</dt><dd>{_money(values['price'])} ₽</dd>"
+    source = 'прайс iiko' if item.get('model', {}).get('price_source') == 'menu' else 'средняя по продажам'
+    return (f"<section><h3>Цена и маржа</h3><dl><dt>Цена продажи порции</dt><dd>{_retail_money(values['price'])} ₽</dd>"
+            f"<dt>Источник цены</dt><dd>{source if values['price'] is not None else 'нет данных'}</dd>"
             f"<dt>Себестоимость порции</dt><dd>{_money(values['cost'])} ₽</dd>"
-            f"<dt>Все порции в розничных ценах</dt><dd>{_money(values['retail_value'])} ₽</dd>"
+            f"<dt>Все порции в розничных ценах</dt><dd>{_retail_money(values['retail_value'])} ₽</dd>"
             f"<dt>Ожидаемая выручка гостей</dt><dd>{_money(values['expected_revenue'])} ₽</dd>"
             f"<dt>Маржа плана после риска остатка и питания</dt><dd>{_money(values['expected_margin'])} ₽</dd></dl>"
-            "<p>Цена и себестоимость — средние из последнего месяца продаж. Маржа порции = цена − себестоимость. "
+            "<p>При наличии цены в прайсе используется текущая цена. Иначе показана средняя по фактическим продажам. "
+            "Себестоимость рассчитана по последнему месяцу продаж. Маржа порции = цена − себестоимость. "
             "Стоимость всех порций в розничных ценах включает питание и не равна плановой выручке. "
             "Маржа плана = цена × ожидаемые продажи гостям − себестоимость × все порции, включая питание. "
             "Непроданный остаток уже учтен в стоимости всего выпуска и повторно не вычитается. "
@@ -92,8 +104,8 @@ def order_totals(rows: list[dict], dates: list[str]) -> dict:
             'rows': len(rows)}
 
 
-def _total_cell(total: dict, money: bool = False) -> str:
-    value = _money(total['value']) if money else (str(total['value']) if total['value'] is not None else 'нет данных')
+def _total_cell(total: dict, format_value=str) -> str:
+    value = format_value(total['value']) if total['value'] is not None else 'нет данных'
     coverage = f"<small>неполный итог: без {total['missing']} поз.</small>" if total['missing'] else ''
     return f"<td class='number'><strong>{value}</strong>{coverage}</td>"
 
@@ -101,5 +113,5 @@ def _total_cell(total: dict, money: bool = False) -> str:
 def render_order_totals(totals: dict) -> str:
     cells = ''.join(_total_cell(day) for day in totals['daily'])
     return ("<tfoot><tr class='order-summary'><th scope='row'>Итого к поставке</th>" + cells
-            + _total_cell(totals['quantity']) + '<td>—</td>' + _total_cell(totals['retail_value'], True)
-            + '<td>—</td>' + _total_cell(totals['expected_margin'], True) + '<td></td><td></td></tr></tfoot>')
+            + _total_cell(totals['quantity']) + '<td>—</td>' + _total_cell(totals['retail_value'], _retail_money)
+            + '<td>—</td>' + _total_cell(totals['expected_margin'], _money) + '<td></td><td></td></tr></tfoot>')

@@ -1,5 +1,5 @@
 #define MyAppName "Сервис заказов кулинарии"
-#define MyAppVersion "0.5.8"
+#define MyAppVersion "0.5.10"
 #define MyAppPublisher "Purchase Forecast Service"
 #define MyAppExeName "purchase-forecast-service.exe"
 
